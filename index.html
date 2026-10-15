@@ -146,6 +146,29 @@
   body.phone.land .el { min-width:0; height:46px; }
   body.phone:not(.land) .grp.on::after { content:''; flex:none; width:22px; }
   body.phone:not(.land) #groups { -webkit-mask-image:linear-gradient(90deg, #000 calc(100% - 28px), transparent); mask-image:linear-gradient(90deg, #000 calc(100% - 28px), transparent); }
+
+  /* ===================== play together ===================== */
+  #netTag { display:none; position:absolute; left:10px; bottom:10px; z-index:5; padding:6px 10px; background:rgba(11,11,10,.82); border:1px solid var(--line); color:var(--dim); font-size:12px; cursor:pointer; }
+  #netTag.show { display:block; }
+  #netTag i { display:inline-block; width:7px; height:7px; border-radius:50%; background:#6c6; margin-right:7px; }
+  #netTag.wait i { background:#ca3; }
+  #netPanel { display:none; position:absolute; top:0; left:0; right:0; bottom:0; z-index:30; background:rgba(0,0,0,.6); align-items:center; justify-content:center; padding:12px; }
+  #netPanel.open { display:flex; }
+  #netPanel .npBox { position:relative; width:min(340px,100%); max-height:100%; overflow:auto; background:var(--bar); border:1px solid var(--line); padding:18px 18px 16px; box-shadow:0 12px 40px rgba(0,0,0,.6); color:var(--dim); font-size:13px; line-height:1.45; }
+  #netPanel .npTitle { color:var(--fg); font-size:15px; margin-bottom:8px; }
+  #netPanel p { margin:0 0 6px; }
+  #netPanel .st { display:none; }
+  #netPanel.idle #npIdle, #netPanel.host #npHosting, #netPanel.guest #npGuest { display:block; }
+  #netPanel .npBox button { display:block; width:100%; height:44px; margin-top:10px; background:var(--bar2); border:1px solid var(--line); color:var(--fg); font-size:14px; cursor:pointer; }
+  #netPanel .npBox button.pri { background:var(--fg); color:#111; }
+  #netPanel #npX { position:absolute; top:2px; right:2px; width:40px; height:40px; margin:0; background:none; border:0; color:var(--dim); font-size:22px; }
+  #netPanel .npRow { display:flex; gap:8px; margin-top:10px; }
+  #netPanel .npRow button { width:92px; margin-top:0; }
+  #netPanel #npCode { flex:1; min-width:0; height:44px; background:var(--bg); border:1px solid var(--line); color:var(--fg); font-size:20px; letter-spacing:.3em; text-align:center; text-transform:uppercase; border-radius:0; }
+  #netPanel .npOr { margin-top:14px; color:var(--faint); }
+  #netPanel .npBig { font-size:34px; letter-spacing:.25em; color:var(--fg); text-align:center; padding:6px 0 2px 10px; }
+  #npMsg { margin-top:10px; min-height:1em; }
+  body.net-guest #bOrient, body.net-guest #mOrient { display:none !important; }
 </style>
 </head>
 <body>
@@ -160,6 +183,7 @@
   </div>
   <div id="mMenu">
     <button id="mStep">step once</button>
+    <button id="mNet">play together</button>
     <button id="mOrient">portrait</button>
     <div class="mstats"><span>fps <b id="mF">0</b></span><span>n <b id="mN">0</b></span><span>quality <b id="mQ">full</b></span></div>
   </div>
@@ -173,10 +197,33 @@
     <button class="tb" id="bHeat" title="Temperature view  [T]">heat</button>
     <button class="tb on" id="bLight" title="Lighting and shadows  [L]">light</button>
     <button class="tb" id="bOrient" title="Portrait / landscape canvas  [P]">portrait</button>
+    <button class="tb" id="bNet" title="Draw on the same canvas as a friend">together</button>
     <label class="brushbox" title="Brush size  [wheel, [ ]]">brush <input type="range" id="brush" min="1" max="30" value="4"><b id="iB">4</b></label>
     <div class="stats"><span>fps <b id="iF">0</b></span><span>n <b id="iN">0</b></span><span>draw <b id="iR">0</b>ms</span></div>
   </div>
-  <div id="stage"><canvas id="c"></canvas><div id="pausedTag">paused</div><div id="toast"></div></div>
+  <div id="stage"><canvas id="c"></canvas><div id="pausedTag">paused</div><div id="toast"></div><div id="netTag"></div>
+    <div id="netPanel" class="idle"><div class="npBox">
+      <button id="npX" aria-label="close">&times;</button>
+      <div class="npTitle">draw together</div>
+      <div id="npIdle" class="st">
+        <p>One shared canvas, two people. You run the simulation, your friend draws on it from their own phone or computer.</p>
+        <button id="npHost" class="pri">start a room</button>
+        <div class="npOr">or join a friend's room</div>
+        <div class="npRow"><input id="npCode" maxlength="5" placeholder="CODE" autocomplete="off" autocapitalize="characters" spellcheck="false"><button id="npJoin">join</button></div>
+      </div>
+      <div id="npHosting" class="st">
+        <div class="npBig" id="npRoom">&middot;&middot;&middot;&middot;&middot;</div>
+        <p id="npInfo">Opening room&hellip;</p>
+        <button id="npShare" class="pri">send invite link</button>
+        <button id="npClose">close room</button>
+      </div>
+      <div id="npGuest" class="st">
+        <p id="npGInfo">Connecting&hellip;</p>
+        <button id="npLeave">leave room</button>
+      </div>
+      <div id="npMsg"></div>
+    </div></div>
+  </div>
   <div id="dock">
     <div id="mtool">
       <div class="seg"><button id="mDraw" class="on">draw</button><button id="mErase">erase</button></div>
@@ -197,6 +244,8 @@ let PORTRAIT = false;
 try {
   const saved = localStorage.getItem('pr-orient');
   PORTRAIT = saved === 'portrait' || /portrait/.test(location.search) || (saved === null && window.innerHeight > window.innerWidth * 1.15);
+  const oq = /[?&]o=([pl])/.exec(location.search);          // an invite link carries the host's canvas shape (?join=CODE&o=p|l) so both sides match
+  if (oq && /[?&]join=/.test(location.search)) PORTRAIT = oq[1] === 'p';
 } catch (e) {}
 const W = PORTRAIT ? 240 : 400, H = PORTRAIT ? 400 : 240, N = W * H;
 const AMBIENT = 22;
@@ -3006,11 +3055,11 @@ function renderHeat() {
   }
 }
 
-function drawCursor() {
+function drawCursorOne() {
   // outline of exactly the cells the brush will paint
   if (mx < 0 || my < 0 || mx >= W || my >= H) return;
   const R = brush, R2 = R * R + 1, er = sel === 0 || down === 2;
-  const cr = er ? 255 : 255, cg = er ? 110 : 255, cb = er ? 100 : 255, al = 0.5;
+  const tn = curTint, cr = tn ? tn[0] : 255, cg = tn ? tn[1] : er ? 110 : 255, cb = tn ? tn[2] : er ? 100 : 255, al = 0.5;
   const ins = (dx, dy) => dx * dx + dy * dy <= R2;
   for (let dy = -R - 1; dy <= R + 1; dy++) for (let dx = -R - 1; dx <= R + 1; dx++) {
     if (!ins(dx, dy) || (ins(dx + 1, dy) && ins(dx - 1, dy) && ins(dx, dy + 1) && ins(dx, dy - 1))) continue;
@@ -3091,17 +3140,25 @@ function showToast(name, desc) {                      // phone layout has no sta
   t.innerHTML = ''; const b = document.createElement('b'); b.textContent = name; t.appendChild(b); t.appendChild(document.createTextNode(desc));
   t.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
 }
+// ---- play together: shared state (the module itself is further down) ----
+const NET = { role: 'solo', peer: null, code: '', actors: [], conn: null, call: null, live: false, hasVideo: false, vid: null, mirror: null, mctx: null, stream: null,
+  lastSt: 0, fps: 0, pmDirty: false, watch: 0, wake: null };
+function netCmd(c) {                                    // a guest does not change the world itself: it asks the host
+  if (NET.role !== 'guest') return false;
+  if (NET.live) gsend({ t: 'c', c });
+  return true;
+}
 const ICON_PAUSE = 'pause';
 const ICON_PLAY = 'play';
-function togglePause() {
-  paused = !paused;
+function togglePause() { if (netCmd('pause')) return; paused = !paused; setPausedUI(); }
+function setPausedUI() {
   $('bPause').innerHTML = paused ? ICON_PLAY : ICON_PAUSE; $('bPause').classList.toggle('on', paused); $('bPause').classList.toggle('warn', paused);
   $('mPause').innerHTML = paused ? ICON_PLAY : ICON_PAUSE; $('mPause').classList.toggle('on', paused); $('mPause').classList.toggle('warn', paused);
   $('pausedTag').style.display = paused ? 'block' : 'none';
 }
-function stepOnce() { if (!paused) togglePause(); step(); }
-function toggleHeat() { heatView = !heatView; $('bHeat').classList.toggle('on', heatView); $('mHeat').classList.toggle('on', heatView); }
-function toggleLight() { lightOn = !lightOn; $('bLight').classList.toggle('on', lightOn); $('mLight').classList.toggle('on', lightOn); }
+function stepOnce() { if (netCmd('step')) return; if (!paused) togglePause(); step(); }
+function toggleHeat() { if (netCmd('heat')) return; heatView = !heatView; $('bHeat').classList.toggle('on', heatView); $('mHeat').classList.toggle('on', heatView); }
+function toggleLight() { if (netCmd('light')) return; lightOn = !lightOn; $('bLight').classList.toggle('on', lightOn); $('mLight').classList.toggle('on', lightOn); }
 $('bPause').innerHTML = ICON_PAUSE; $('mPause').innerHTML = ICON_PAUSE;
 $('bPause').onclick = () => togglePause();
 $('bStep').onclick = () => stepOnce();
@@ -3109,6 +3166,8 @@ $('bClear').onclick = () => clearAll();
 $('bHeat').onclick = () => toggleHeat();
 $('bLight').onclick = () => toggleLight();
 function toggleOrient() {
+  if (NET.role === 'guest') return;
+  if (NET.role === 'host' && NET.actors.length && !confirm('Changing the canvas shape restarts the page and ends the room. Continue?')) return;
   try { localStorage.setItem('pr-orient', PORTRAIT ? 'landscape' : 'portrait'); } catch (e) {}
   location.reload();
 }
@@ -3131,7 +3190,7 @@ function applyLayout() {
   document.body.classList.toggle('land', phone && window.innerWidth > window.innerHeight);
   // the canvas is portrait or landscape (fixed when the page loads): offer to switch when it no longer matches how the phone is held
   const heldPortrait = window.innerHeight > window.innerWidth * 1.05;
-  $('rotateBar').classList.toggle('show', phone && !rbDismissed && heldPortrait !== PORTRAIT && Math.abs(window.innerHeight - window.innerWidth) > 40);
+  $('rotateBar').classList.toggle('show', phone && !rbDismissed && NET.role === 'solo' && heldPortrait !== PORTRAIT && Math.abs(window.innerHeight - window.innerWidth) > 40);
   resize();
 }
 $('mPause').onclick = () => togglePause();
@@ -3163,7 +3222,12 @@ window.addEventListener('resize', applyLayout);
 window.addEventListener('orientationchange', () => setTimeout(applyLayout, 150));
 document.addEventListener('gesturestart', e => e.preventDefault());   // iOS pinch-zoom ignores user-scalable=no
 applyLayout();
-function clearAll() { dmg.fill(0); soot.fill(0); grp.fill(0); held.fill(0); ng = 0; RBS.length = 0; rbOwner.fill(0); type.fill(0); temp.fill(AMBIENT); life.fill(0); vel.fill(0); hv.fill(0); lOcc.fill(0); lKind.fill(-1); np = 0;
+function clearAll() {
+  if (NET.role === 'guest') {                                      // the shared canvas: ask the host, and make sure it was meant
+    if (NET.live && (document.body.classList.contains('phone') || confirm('Clear the canvas for everyone?'))) gsend({ t: 'c', c: 'clear' });
+    return;
+  }
+  dmg.fill(0); soot.fill(0); grp.fill(0); held.fill(0); ng = 0; RBS.length = 0; rbOwner.fill(0); type.fill(0); temp.fill(AMBIENT); life.fill(0); vel.fill(0); hv.fill(0); lOcc.fill(0); lKind.fill(-1); np = 0;
   gS.fill(0); gV.fill(0); gM.fill(0); gF.fill(0); gC.fill(0); gK.fill(0); gH.fill(0); AX.fill(0); AY.fill(0); AP.fill(0); }
 
 function cellAt(e) {
@@ -3246,23 +3310,28 @@ function line(x0, y0, x1, y1, erase) {
 }
 cv.addEventListener('contextmenu', e => e.preventDefault());
 cv.addEventListener('pointerdown', e => {
-  if (e.pointerType === 'touch' && down) { down = 0; held.fill(0); return; }
+  if (e.pointerType === 'touch' && down) { down = 0; held.fill(0); if (NET.role === 'guest') gsend({ t: 'u', c: 1 }); return; }
   cv.setPointerCapture(e.pointerId);
   spawnBudget = IS_TOUCH ? 220 : 500;                    // a quick tap must still drop liquid before the next frame resets the budget
   down = e.button === 2 || eraseMode ? 2 : 1;
   [mx, my] = cellAt(e); lx = mx; ly = my;
+  if (NET.role === 'guest') { netPtr('d'); return; }
   line(mx, my, mx, my, down === 2);
 });
-window.addEventListener('pointerup', e => { down = 0; held.fill(0); if (e.pointerType === 'touch') mx = my = -1; });   // a lifted finger leaves no brush outline behind   // let go: what you drew now feels gravity
+window.addEventListener('pointerup', e => {
+  if (NET.role === 'guest' && down) { if (NET.pmDirty) { NET.pmDirty = false; netPtr('m'); } gsend({ t: 'u', c: e.pointerType === 'touch' ? 1 : 0 }); }
+  down = 0; held.fill(0); if (e.pointerType === 'touch') mx = my = -1;
+});   // a lifted finger leaves no brush outline behind   // let go: what you drew now feels gravity
 cv.addEventListener('pointermove', e => {
   [mx, my] = cellAt(e);
   shiftDown = e.shiftKey;
+  if (NET.role === 'guest') { lx = mx; ly = my; NET.pmDirty = true; return; }   // the host paints it; this side only reports where the finger is
   windX = windX * 0.6 + (mx - lx) * 0.4; windY = windY * 0.6 + (my - ly) * 0.4;   // wind follows the drag
   if (down && (sel === ID.WIND || sel === ID.HEAT || sel === ID.COOL) && down !== 2) { lx = mx; ly = my; return; }
   if (down) { line(lx, ly, mx, my, down === 2); }
   lx = mx; ly = my;
 });
-cv.addEventListener('pointerleave', () => { if (!down) mx = my = -1; });
+cv.addEventListener('pointerleave', () => { if (!down) { mx = my = -1; if (NET.role === 'guest') { NET.pmDirty = false; netPtr('m'); } } });
 cv.addEventListener('wheel', e => { e.preventDefault(); const d = e.shiftKey ? 3 : 1; setBrush(brush + (e.deltaY < 0 ? d : -d)); }, { passive:false });
 function setBrush(v) { brush = Math.max(1, Math.min(30, v | 0)); $('iB').textContent = brush; $('brush').value = brush; $('mBv').textContent = brush; $('mBrush').value = brush; }
 window.addEventListener('keydown', e => {
@@ -3303,6 +3372,282 @@ window.addEventListener('resize', resize); resize();
   }
 })();
 
+// ---------- play together ----------
+// Peer to peer (WebRTC, via the free PeerJS broker only to introduce the two devices). The HOST runs the one simulation and streams
+// its picture as video; a GUEST sends only where and what it draws, plus a few commands. So nothing can drift out of sync and the
+// guest's phone does no simulation at all.
+const NET_V = 1, NET_MAX = 3, NET_TINT = [[120, 220, 255], [255, 215, 90], [255, 140, 215]];
+const PEER_SRC = ['https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js', 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js'];
+let curTint = null;
+
+function loadPeerLib() {
+  return new Promise((res, rej) => {
+    if (!window.Peer && window.peerjs && window.peerjs.Peer) window.Peer = window.peerjs.Peer;
+    if (window.Peer) return res();
+    let i = 0;
+    const next = () => {
+      if (i >= PEER_SRC.length) return rej(new Error('peerjs'));
+      const s = document.createElement('script');
+      s.src = PEER_SRC[i++];
+      s.onload = () => { if (!window.Peer && window.peerjs && window.peerjs.Peer) window.Peer = window.peerjs.Peer; window.Peer ? res() : next(); };
+      s.onerror = () => { s.remove(); next(); };
+      document.head.appendChild(s);
+    };
+    next();
+  });
+}
+function newCode() { const A = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; let s = ''; for (let i = 0; i < 5; i++) s += A[Math.random() * A.length | 0]; return s; }
+function setRole(r) { NET.role = r; document.body.classList.toggle('net-guest', r === 'guest'); applyLayout(); }
+function netState(s) { const p = $('netPanel'); p.classList.remove('idle', 'host', 'guest'); p.classList.add(s); }
+function netOpen(v) { $('netPanel').classList.toggle('open', v); if (v) $('mMenu').classList.remove('open'); }
+function netMsg(t, bad) { const m = $('npMsg'); m.textContent = t || ''; m.style.color = bad ? 'var(--hot)' : ''; }
+function netTag(text, wait) {
+  const t = $('netTag');
+  if (!text) { t.className = ''; t.textContent = ''; return; }
+  t.textContent = ''; t.appendChild(document.createElement('i')); t.appendChild(document.createTextNode(text));
+  t.className = 'show' + (wait ? ' wait' : '');
+}
+function inviteURL() { return location.origin + location.pathname + '?join=' + NET.code + '&o=' + (PORTRAIT ? 'p' : 'l'); }
+async function keepAwake() { try { if (navigator.wakeLock && !NET.wake) { NET.wake = await navigator.wakeLock.request('screen'); NET.wake.addEventListener('release', () => { NET.wake = null; }); } } catch (e) {} }
+document.addEventListener('visibilitychange', () => { if (!document.hidden && NET.role !== 'solo') keepAwake(); });
+window.addEventListener('pagehide', () => { try { if (NET.peer) NET.peer.destroy(); } catch (e) {} });
+
+// the cursor of every friend is drawn on the host's picture (and so also in the stream), tinted so they can be told apart
+function drawCursor() {
+  drawCursorOne();
+  if (!NET.actors.length) return;
+  for (const a of NET.actors) if (a.mx >= 0) { curTint = NET_TINT[a.idx % NET_TINT.length]; asActor(a, drawCursorOne); }
+  curTint = null;
+}
+// run fn with the brush globals (material, size, position, button) temporarily set to a friend's: the one painting code serves everybody
+function asActor(a, fn) {
+  const s0 = sel, s1 = brush, s2 = down, s3 = mx, s4 = my, s5 = lx, s6 = ly, s7 = windX, s8 = windY;
+  sel = a.sel; brush = a.brush; down = a.down; mx = a.mx; my = a.my; lx = a.lx; ly = a.ly; windX = a.windX; windY = a.windY;
+  try { fn(); }
+  finally {
+    a.sel = sel; a.brush = brush; a.down = down; a.mx = mx; a.my = my; a.lx = lx; a.ly = ly; a.windX = windX; a.windY = windY;
+    sel = s0; brush = s1; down = s2; mx = s3; my = s4; lx = s5; ly = s6; windX = s7; windY = s8;
+  }
+}
+function netActorsPaint() {                              // held-down brushes keep pouring every frame, like the local one
+  for (const a of NET.actors) {
+    if (a.down && a.mx >= 0 && a.sel !== 0 && KIND[a.sel] !== 1) { spawnBudget = IS_TOUCH ? 220 : 500; asActor(a, () => paint(mx, my, down === 2)); }
+  }
+}
+
+// ---- host ----
+function hostStart() {
+  netState('host'); netMsg('Connecting…'); $('npRoom').textContent = '·····'; $('npInfo').textContent = 'Opening room…';
+  loadPeerLib().then(() => openRoom(0)).catch(() => { netState('idle'); netMsg("Couldn't reach the connection service. Check your internet and try again.", true); });
+}
+function openRoom(tries) {
+  const code = newCode(), peer = new Peer('pxr-' + code);
+  let opened = false;
+  NET.peer = peer; NET.code = code;
+  peer.on('open', () => {
+    opened = true; setRole('host'); netMsg('');
+    $('npRoom').textContent = code; hostInfo(); keepAwake();
+  });
+  peer.on('connection', hostAccept);
+  peer.on('disconnected', () => { try { peer.reconnect(); } catch (e) {} });
+  peer.on('error', err => {
+    if (opened) return;
+    try { peer.destroy(); } catch (e) {}
+    if (err && err.type === 'unavailable-id' && tries < 6) { openRoom(tries + 1); return; }
+    NET.peer = null; netState('idle'); netMsg("Couldn't open a room (" + ((err && err.type) || 'error') + '). Try again.', true);
+  });
+}
+function hostInfo() {
+  const n = NET.actors.length;
+  $('npInfo').textContent = n ? n + (n > 1 ? ' friends are' : ' friend is') + ' drawing with you.' : 'Waiting for your friend. Send them the link, or just the code.';
+  netTag('room ' + NET.code + (n ? ' · ' + n + ' here' : ' · waiting'), !n);
+}
+function hostReset() {
+  for (const a of NET.actors) { try { a.conn.close(); } catch (e) {} }
+  NET.actors = [];
+  try { if (NET.peer) NET.peer.destroy(); } catch (e) {}
+  if (NET.stream) NET.stream.getTracks().forEach(t => t.stop());
+  NET.peer = null; NET.stream = null; NET.mirror = null; NET.mctx = null;
+  setRole('solo'); netTag('');
+  try { if (NET.wake) NET.wake.release(); } catch (e) {}
+}
+function hostAccept(conn) {
+  conn.on('open', () => {
+    if (NET.actors.length >= NET_MAX) { try { conn.send({ t: 'full' }); } catch (e) {} setTimeout(() => { try { conn.close(); } catch (e) {} }, 300); return; }
+    let idx = 0; while (NET.actors.some(x => x.idx === idx)) idx++;
+    const a = { conn, id: conn.peer, idx, sel: ID.WATER, brush: 4, down: 0, mx: -1, my: -1, lx: -1, ly: -1, windX: 0, windY: 0, call: null };
+    NET.actors.push(a); netOpen(false);                  // a friend is in: get the panel out of the way
+    conn.on('data', m => { try { hostData(a, m); } catch (e) { console.error('net message', e); } });
+    conn.on('close', () => hostDrop(a));
+    conn.on('error', () => hostDrop(a));
+    hostInfo();
+  });
+}
+function hostDrop(a) {
+  const k = NET.actors.indexOf(a); if (k < 0) return;
+  NET.actors.splice(k, 1);
+  try { if (a.call) a.call.close(); } catch (e) {}
+  if (!NET.actors.length) { held.fill(0); NET.mirror = NET.mctx = null; if (NET.stream) NET.stream.getTracks().forEach(t => t.stop()); NET.stream = null; }
+  hostInfo();
+}
+function ensureStream() {
+  if (NET.stream && NET.stream.active) return;
+  const m = document.createElement('canvas'); m.width = W; m.height = H;   // a plain canvas to stream from (the visible one uses a low-latency mode that streams unreliably)
+  NET.mirror = m; NET.mctx = m.getContext('2d', { alpha: false }); NET.mctx.putImageData(img, 0, 0);
+  NET.stream = m.captureStream(30);
+  try { NET.stream.getVideoTracks()[0].contentHint = 'detail'; } catch (e) {}
+}
+function tuneSender(call, tries) {                       // pixel art needs sharp frames: allow plenty of bitrate, never shrink the picture
+  try {
+    const pc = call.peerConnection;
+    for (const s of pc.getSenders()) {
+      if (!s.track || s.track.kind !== 'video') continue;
+      const p = s.getParameters(); if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+      p.encodings[0].maxBitrate = 3000000; p.degradationPreference = 'maintain-resolution';
+      s.setParameters(p).catch(() => {});
+    }
+  } catch (e) { if (tries < 6) setTimeout(() => tuneSender(call, tries + 1), 800); }
+}
+const clampI = (v, lo, hi) => { v = +v; return Number.isFinite(v) ? Math.max(lo, Math.min(hi, Math.round(v))) : lo; };
+function hostData(a, m) {
+  if (!m || typeof m !== 'object') return;
+  const t = m.t;
+  if (t === 'hi') {
+    if (m.v !== NET_V) { a.conn.send({ t: 'bad', why: 'This room runs a different version of the game. Refresh both pages and try again.' }); return; }
+    a.conn.send({ t: 'hello', v: NET_V, W, H, p: PORTRAIT ? 1 : 0 });
+    ensureStream();
+    a.call = NET.peer.call(a.id, NET.stream);
+    setTimeout(() => tuneSender(a.call, 0), 1500);
+    return;
+  }
+  if (t === 'c') {
+    ({ pause: togglePause, step: stepOnce, clear: clearAll, heat: toggleHeat, light: toggleLight })[m.c]?.();
+    NET.lastSt = 0; return;
+  }
+  if (t !== 'd' && t !== 'm' && t !== 'u') return;
+  const S = +m.s; if (Number.isInteger(S) && S >= 0 && S < DEFS.length) a.sel = S;
+  a.brush = clampI(m.b, 1, 30);
+  if (t === 'u') {
+    a.down = 0; if (m.c) a.mx = a.my = -1;
+    if (!down && !NET.actors.some(x => x.down)) held.fill(0);
+    return;
+  }
+  if (+m.x < 0) { a.mx = a.my = -1; return; }              // pointer left the canvas
+  const x = clampI(m.x, 0, W - 1), y = clampI(m.y, 0, H - 1);
+  if (t === 'd') {
+    a.down = m.e ? 2 : 1; a.mx = x; a.my = y; a.lx = x; a.ly = y;
+    spawnBudget = IS_TOUCH ? 220 : 500;
+    asActor(a, () => line(mx, my, mx, my, down === 2));
+    return;
+  }
+  a.mx = x; a.my = y;
+  if (a.lx < 0) { a.lx = x; a.ly = y; }
+  asActor(a, () => {
+    windX = windX * 0.6 + (mx - lx) * 0.4; windY = windY * 0.6 + (my - ly) * 0.4;
+    if (down && (sel === ID.WIND || sel === ID.HEAT || sel === ID.COOL) && down !== 2) { lx = mx; ly = my; return; }
+    if (down) { spawnBudget = IS_TOUCH ? 220 : 500; line(lx, ly, mx, my, down === 2); }
+    lx = mx; ly = my;
+  });
+}
+function netHostFrame(now) {
+  if (NET.mctx) NET.mctx.putImageData(img, 0, 0);
+  if (now - NET.lastSt > 500) {
+    NET.lastSt = now;
+    const st = { t: 'st', p: paused ? 1 : 0, h: heatView ? 1 : 0, l: lightOn ? 1 : 0, f: NET.fps, q: qLevel };
+    for (const a of NET.actors) { try { if (a.conn.open) a.conn.send(st); } catch (e) {} }
+  }
+}
+
+// ---- guest ----
+function gsend(o) { try { if (NET.conn && NET.conn.open) NET.conn.send(o); } catch (e) {} }
+function netPtr(k) { if (NET.live) gsend({ t: k, x: mx, y: my, s: sel, b: brush, e: down === 2 ? 1 : 0 }); }
+function guestJoin(raw) {
+  const code = String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (code.length !== 5) { netMsg('Enter the 5-character room code.', true); return; }
+  netMsg(''); NET.code = code; NET.live = false; NET.hasVideo = false;
+  setRole('guest'); netState('guest'); $('npGInfo').textContent = 'Connecting to room ' + code + '…'; netTag('joining ' + code + '…', true);
+  clearTimeout(NET.watch);
+  NET.watch = setTimeout(() => { if (NET.role === 'guest' && !(NET.live && NET.hasVideo)) guestLeave("Couldn't connect. Some mobile networks block direct connections: try the same Wi-Fi, or another network."); }, 25000);
+  loadPeerLib().then(() => {
+    if (NET.role !== 'guest') return;
+    const peer = new Peer(); NET.peer = peer;
+    peer.on('open', () => {
+      const conn = peer.connect('pxr-' + code, { reliable: true, serialization: 'json' }); NET.conn = conn;
+      conn.on('open', () => gsend({ t: 'hi', v: NET_V }));
+      conn.on('data', m => { try { guestData(m); } catch (e) { console.error('net message', e); } });
+      conn.on('close', () => { if (NET.role === 'guest') guestLeave('The host closed the room.'); });
+      conn.on('error', () => { if (NET.role === 'guest') guestLeave('Connection lost.'); });
+    });
+    peer.on('call', call => { call.answer(); NET.call = call; call.on('stream', guestStream); });
+    peer.on('error', err => {
+      const ty = err && err.type;
+      if (NET.role !== 'guest' || (NET.live && ty !== 'network')) return;
+      guestLeave(ty === 'peer-unavailable' ? 'No room with that code. Check it and try again.' : "Couldn't connect (" + (ty || 'error') + ').');
+    });
+  }).catch(() => guestLeave("Couldn't reach the connection service. Check your internet and try again."));
+}
+function guestData(m) {
+  if (!m || typeof m !== 'object') return;
+  if (m.t === 'hello') {
+    if (m.W !== W || m.H !== H) { location.replace(location.pathname + '?join=' + NET.code + '&o=' + (m.p ? 'p' : 'l')); return; }   // reload in the host's canvas shape
+    NET.live = true; $('npGInfo').textContent = 'Connected to room ' + NET.code + '. You are drawing on the host’s canvas.';
+    netTag('room ' + NET.code, !NET.hasVideo); netOpen(false); keepAwake(); netPtr('m');
+  } else if (m.t === 'st') {
+    if (!!m.p !== paused) { paused = !!m.p; setPausedUI(); }
+    if (!!m.h !== heatView) { heatView = !!m.h; $('bHeat').classList.toggle('on', heatView); $('mHeat').classList.toggle('on', heatView); }
+    if (!!m.l !== lightOn) { lightOn = !!m.l; $('bLight').classList.toggle('on', lightOn); $('mLight').classList.toggle('on', lightOn); }
+    if (m.f !== undefined) { $('iF').textContent = m.f; $('mF').textContent = m.f; }
+    if (m.q !== undefined) $('mQ').textContent = Q_NAMES[m.q] || '';
+  } else if (m.t === 'full') guestLeave('That room is full.');
+  else if (m.t === 'bad') guestLeave(m.why || 'Could not join.');
+}
+function guestStream(s) {
+  let v = NET.vid;
+  if (!v) {                                              // the video is only a source for the canvas, but it has to be in the page to play
+    v = NET.vid = document.createElement('video');
+    v.muted = true; v.playsInline = true; v.autoplay = true; v.setAttribute('playsinline', ''); v.setAttribute('muted', '');
+    v.style.cssText = 'position:fixed;left:0;top:0;width:4px;height:4px;opacity:.01;pointer-events:none;z-index:-1';
+    document.body.appendChild(v);
+  }
+  v.srcObject = s; v.play().catch(() => {});
+  NET.hasVideo = true; if (NET.live) netTag('room ' + NET.code, false);
+}
+function guestFrame(now) {
+  last = now;
+  const v = NET.vid;
+  if (v && v.readyState >= 2 && v.videoWidth) ctx.drawImage(v, 0, 0, W, H);
+  if (NET.pmDirty && NET.live) { NET.pmDirty = false; netPtr('m'); }
+}
+function guestLeave(msg) {
+  clearTimeout(NET.watch);
+  try { if (NET.peer) NET.peer.destroy(); } catch (e) {}
+  if (NET.vid) { NET.vid.srcObject = null; NET.vid.remove(); NET.vid = null; }
+  NET.peer = NET.conn = NET.call = null; NET.live = false; NET.hasVideo = false;
+  try { if (NET.wake) NET.wake.release(); } catch (e) {}
+  setRole('solo'); netTag(''); netState('idle'); netOpen(true); netMsg(msg || '', !!msg);
+  down = 0; mx = my = -1;
+}
+
+// ---- buttons ----
+function netPanelOpen() { netState(NET.role === 'host' ? 'host' : NET.role === 'guest' ? 'guest' : 'idle'); netOpen(true); }
+$('bNet').onclick = netPanelOpen;
+$('mNet').onclick = netPanelOpen;
+$('netTag').onclick = netPanelOpen;
+$('npX').onclick = () => netOpen(false);
+$('npHost').onclick = () => hostStart();
+$('npJoin').onclick = () => guestJoin($('npCode').value);
+$('npClose').onclick = () => { hostReset(); netState('idle'); netMsg('Room closed.'); };
+$('npLeave').onclick = () => guestLeave('');
+$('npShare').onclick = async () => {
+  const url = inviteURL();
+  try { if (navigator.share) { await navigator.share({ title: 'pixelrealism', text: 'Draw with me on one canvas', url }); return; } } catch (e) { if (e && e.name === 'AbortError') return; }
+  try { await navigator.clipboard.writeText(url); netMsg('Invite link copied. Send it to your friend.'); }
+  catch (e) { window.prompt('Send this link to your friend:', url); }
+};
+for (const ev of ['keydown', 'keyup']) $('npCode').addEventListener(ev, e => { e.stopPropagation(); if (ev === 'keydown' && e.key === 'Enter') guestJoin($('npCode').value); });   // typing the code must not trigger the game's shortcuts
+$('npCode').addEventListener('input', e => { e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''); });
+{ const jm = /[?&]join=([A-Za-z0-9]{5})(?![A-Za-z0-9])/.exec(location.search); if (jm) { netOpen(true); guestJoin(jm[1]); } }
+
 let last = performance.now(), acc = 0, fc = 0, fAcc = 0, stepMs = 8, gHi = 0, gLo = 0;
 // Frame governor: work = ms of simulation + drawing per displayed frame (16.7 would be a steady 60 fps).
 // Too slow for a while -> drop to the next quality level (fewer pressure sweeps, then lighting off); lots of headroom -> back up.
@@ -3313,15 +3658,17 @@ function govern(work) {
   else { gHi = 0; gLo = 0; }
 }
 function frameBody(now) {
+  if (NET.role === 'guest') { guestFrame(now); return; }
   const dt = now - last; last = now;
   fAcc += dt; fc++;
   if (fAcc > 500) {
     const fps = Math.round(fc * 1000 / fAcc);
-    $('iF').textContent = fps; $('iR').textContent = renderMs.toFixed(1); $('mF').textContent = fps; $('mQ').textContent = Q_NAMES[qLevel];
+    NET.fps = fps; $('iF').textContent = fps; $('iR').textContent = renderMs.toFixed(1); $('mF').textContent = fps; $('mQ').textContent = Q_NAMES[qLevel];
     fc = 0; fAcc = 0;
   }
   spawnBudget = IS_TOUCH ? 220 : 500;
   if (down && mx >= 0 && sel !== 0 && KIND[sel] !== 1) paint(mx, my, down === 2); // continuous pour
+  if (NET.actors.length) netActorsPaint();                              // ... and the friends' brushes
   let nSteps = 0;
   if (!paused) {
     // fixed 60 Hz simulation time, but never more steps than the device can afford: when a step is slow it runs one per
@@ -3335,6 +3682,7 @@ function frameBody(now) {
     if (acc > 16.67) acc = 16.67;
   }
   render();
+  if (NET.actors.length) netHostFrame(now);                             // copy the picture to the stream, tell friends the state
   if (!paused) govern(stepMs * nSteps + renderMs);
   if (TEXQ.length) texPump(IS_TOUCH ? 4 : 6);          // material textures are baked in the background, a few ms per frame
   if ((rc & 7) === 0 && mx >= 0 && inb(mx, my)) {
