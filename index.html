@@ -303,9 +303,12 @@ const DEFS = [
   { key:'HEAT', n:'Heat', c:[214,92,52], k:0, d:0, h:0 },
   { key:'COOL', n:'Cool', c:[96,160,224], k:0, d:0, h:0 },
   { key:'WIND', n:'Wind', c:[150,160,150], k:0, d:0, h:0 },
+  { key:'AIR', n:'Air', c:[196,214,226], k:0, d:0, h:0 },
+  { key:'VACUUM', n:'Vacuum', c:[132,98,176], k:0, d:0, h:0 },
 ];
 const ID = {};
 DEFS.forEach((e, i) => { ID[e.key] = i; });
+const isTool = s => s === ID.HEAT || s === ID.COOL || s === ID.WIND || s === ID.AIR || s === ID.VACUUM;   // brush tools: they act on what is under the brush instead of placing material
 DEFS.forEach(e => {
   if (e.hotTo) e.hotTo = ID[e.hotTo];
   if (e.coldTo) e.coldTo = ID[e.coldTo];
@@ -779,7 +782,7 @@ const AX = new Float32Array(GN), AY = new Float32Array(GN), AX2 = new Float32Arr
 const AP = new Float32Array(GN), AD = new Float32Array(GN), ASol = new Uint8Array(GN), ACT = new Float32Array(GN), ACS = new Float32Array(GN);
 const AVort = new Float32Array(GN);
 const AEx = new Float32Array(GN), gIgn = new Uint8Array(N), ACK = new Float32Array(GN), ACH = new Float32Array(GN);          // gas expansion from combustion this frame (pushes the air outward: whoomph)
-const A_BUOY = 0.0009, A_SMOKEW = 0.004, A_VORT = 0.25, A_ITERS = 14, A_VMAX = 4, A_SOR = 1.6;
+const A_BUOY = 0.0014, A_SMOKEW = 0.004, A_VORT = 0.1, A_ITERS = 14, A_VMAX = 4, A_SOR = 1.6;
 function isAir(i) { return type[i] === 0 && lOcc[i] === 0; }
 function airAbove(c) {            // nearest air pixel straight up (used when gas is born inside a liquid)
   for (let y = (c / W) | 0, x = c % W, d = 0; y >= 0 && d < 60; y--, d++) { const j = y * W + x; if (type[j] !== 0) return -1; if (!lOcc[j]) return j; }
@@ -849,7 +852,9 @@ function airVelocity() {
     if (ASol[c]) { AD[c] = 0; continue; }
     const xr = i < GX - 1 && !ASol[c + 1] ? AX[c + 1] : 0, xl = i > 0 && !ASol[c - 1] ? AX[c - 1] : 0;
     const yd = j < GY - 1 && !ASol[c + GX] ? AY[c + GX] : 0, yu = j > 0 ? (!ASol[c - GX] ? AY[c - GX] : 0) : AY[c];
-    AD[c] = (xr - xl + yd - yu) * 0.5 - AEx[c];
+    // (the pressure below solves  laplacian(p) = divergence  exactly once: it used to solve for twice the divergence, so every
+    //  projection overshot, the air sloshed back and forth and wind kept ringing long after it stopped)
+    AD[c] = (xr - xl + yd - yu) * 0.5 - AEx[c] * 3;
   }
   for (let it = 0; it < A_ITERS; it++) {
     for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
@@ -859,7 +864,7 @@ function airVelocity() {
       const pr = i < GX - 1 && !ASol[c + 1] ? AP[c + 1] : AP[c];
       const pu = j > 0 ? (!ASol[c - GX] ? AP[c - GX] : AP[c]) : 0;
       const pd = j < GY - 1 && !ASol[c + GX] ? AP[c + GX] : AP[c];
-      AP[c] += A_SOR * ((pl + pr + pu + pd - AD[c] * 2) * 0.25 - AP[c]);
+      AP[c] += A_SOR * ((pl + pr + pu + pd - AD[c]) * 0.25 - AP[c]);
     }
   }
   for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
@@ -3093,6 +3098,8 @@ const DESC = {
   SHARDS: 'Broken glass', SAWDUST: 'Light, flammable', ASH: 'Fluffy remains of a fire', HEATER: 'Keeps itself at 700 °C', COOLER: 'Keeps itself at −120 °C',
   HEAT: 'Warms whatever is under the brush. Hold Shift for a blowtorch', COOL: 'Chills whatever is under the brush. Hold Shift for liquid-nitrogen cold',
   WIND: 'Drag to blow air in that direction. Hold Shift for a gale',
+  AIR: 'Pumps pressure into the air: blasts smoke, gas, grains and liquid outward. Hold Shift for a burst',
+  VACUUM: 'Sucks air, gas and loose material toward the brush. Hold Shift for a hard pull',
   COAL: 'Burns slowly and very hot', CEMENT: 'Sets into concrete when it gets wet', THERMITE: 'Burns at 2500 °C and melts through metal; needs a hot start',
   SEED: 'Sprouts into a plant on damp soil', CLAY: 'Sticky; fires into brick in strong heat', CONCRETE: 'Strong and heavy', BRICK: 'Strong, fire-proof',
   RUBBER: 'Bouncy, unbreakable, burns with thick smoke', COPPER: 'Conducts heat best, turns green in water', TNT: 'Blows up when heated',
@@ -3250,6 +3257,45 @@ function toolPaint(x, y) {
     for (let k = 0; k < ng; k++) { const dx = gpx[k] - x - 0.5, dy = gpy[k] - y - 0.5; if (dx * dx + dy * dy <= r2 && (hot ? gtm[k] < lim : gtm[k] > lim)) gtm[k] = f(gtm[k]); }
     return;
   }
+  if (sel === ID.AIR || sel === ID.VACUUM) {
+    // pressure: an air source (or sink) in the middle of the brush. The air solver turns it into a real outward (inward) flow that
+    // carries smoke and gas; liquid and loose grains also get a direct radial shove, and the vacuum swallows gas near its centre
+    const out = sel === ID.AIR, g = (shiftDown ? 3 : 1) * (out ? 1 : -1), gr = Math.ceil(r / GS) + 1;
+    const gx0 = (x / GS) | 0, gy0 = (y / GS) | 0;
+    for (let j = gy0 - gr; j <= gy0 + gr; j++) for (let i = gx0 - gr; i <= gx0 + gr; i++) {
+      if (i < 0 || j < 0 || i >= GX || j >= GY) continue;
+      const dd = ((i - gx0) ** 2 + (j - gy0) ** 2) / (gr * gr), c = j * GX + i;
+      if (dd > 1 || ASol[c]) continue;
+      AEx[c] += g * 0.5 * (1 - dd);
+    }
+    const reach = r * 2.5 + 12, rr2 = reach * reach;
+    for (let k = 0; k < np; k++) {
+      const dx = px[k] - x - 0.5, dy = py[k] - y - 0.5, d2 = dx * dx + dy * dy; if (d2 > rr2) continue;
+      const d = Math.sqrt(d2) + 1, f = (1 - d / reach) * 0.5 * g / d;
+      pvx[k] += dx * f; pvy[k] += dy * f;
+    }
+    for (let k = 0; k < ng; k++) {
+      const dx = gpx[k] - x - 0.5, dy = gpy[k] - y - 0.5, d2 = dx * dx + dy * dy; if (d2 > rr2) continue;
+      const d = Math.sqrt(d2) + 1, f = (1 - d / reach) * 0.7 * g / d;
+      gvx[k] += dx * f; gvy[k] += dy * f;
+    }
+    if (out) {                                          // expanding air thins the gas it pushes (otherwise a diverging flow would make smoke out of nothing)
+      const cr = reach | 0, cr2 = cr * cr;
+      for (let dy = -cr; dy <= cr; dy++) for (let dx = -cr; dx <= cr; dx++) {
+        if (dx * dx + dy * dy > cr2 || !inb(x + dx, y + dy)) continue;
+        const i = (y + dy) * W + x + dx, k = 1 - 0.05 * (1 - Math.sqrt(dx * dx + dy * dy) / cr);
+        gS[i] *= k; gV[i] *= k; gM[i] *= k; gF[i] *= k; gK[i] *= k; gH[i] *= k;
+      }
+    } else {                                            // the vacuum removes gas, smoke and flame that reach its core
+      const cr = r + 1, cr2 = cr * cr;
+      for (let dy = -cr; dy <= cr; dy++) for (let dx = -cr; dx <= cr; dx++) {
+        if (dx * dx + dy * dy > cr2 || !inb(x + dx, y + dy)) continue;
+        const i = (y + dy) * W + x + dx, k = shiftDown ? 0.5 : 0.8;
+        gS[i] *= k; gV[i] *= k; gM[i] *= k; gF[i] *= k; gK[i] *= k; gH[i] *= k;
+      }
+    }
+    return;
+  }
   if (sel === ID.WIND) {
     const l = Math.hypot(windX, windY);
     if (l < 0.05) return;
@@ -3273,7 +3319,7 @@ function paint(x, y, erase) {
   // a huge brush used to add well over a thousand particles per frame; thin the pour so the flow stays bounded
   const pourP = Math.min(0.5, spawnBudget / (3.2 * (r * r + 1)));
   if (!erase && sel !== 0 && KIND[sel] === 3 && np >= PCAP) noteCap();
-  if (!erase && (sel === ID.HEAT || sel === ID.COOL || sel === ID.WIND)) { toolPaint(x, y); return; }
+  if (!erase && isTool(sel)) { toolPaint(x, y); return; }
   if (erase || sel === 0) {
     for (let k = np - 1; k >= 0; k--) {
       const dx = px[k] - x - 0.5, dy = py[k] - y - 0.5;
@@ -3327,7 +3373,7 @@ cv.addEventListener('pointermove', e => {
   shiftDown = e.shiftKey;
   if (NET.role === 'guest') { lx = mx; ly = my; NET.pmDirty = true; return; }   // the host paints it; this side only reports where the finger is
   windX = windX * 0.6 + (mx - lx) * 0.4; windY = windY * 0.6 + (my - ly) * 0.4;   // wind follows the drag
-  if (down && (sel === ID.WIND || sel === ID.HEAT || sel === ID.COOL) && down !== 2) { lx = mx; ly = my; return; }
+  if (down && isTool(sel) && down !== 2) { lx = mx; ly = my; return; }
   if (down) { line(lx, ly, mx, my, down === 2); }
   lx = mx; ly = my;
 });
@@ -3544,7 +3590,7 @@ function hostData(a, m) {
   if (a.lx < 0) { a.lx = x; a.ly = y; }
   asActor(a, () => {
     windX = windX * 0.6 + (mx - lx) * 0.4; windY = windY * 0.6 + (my - ly) * 0.4;
-    if (down && (sel === ID.WIND || sel === ID.HEAT || sel === ID.COOL) && down !== 2) { lx = mx; ly = my; return; }
+    if (down && isTool(sel) && down !== 2) { lx = mx; ly = my; return; }
     if (down) { spawnBudget = IS_TOUCH ? 220 : 500; line(lx, ly, mx, my, down === 2); }
     lx = mx; ly = my;
   });
