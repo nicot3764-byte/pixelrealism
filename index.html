@@ -796,44 +796,82 @@ function isAir(i) { return type[i] === 0 && lOcc[i] === 0; }
 const PR = new Float32Array(GN), PR2 = new Float32Array(GN), PXv = new Float32Array(GN), PYv = new Float32Array(GN);
 const PGX = new Float32Array(GN), PGY = new Float32Array(GN), PDV = new Float32Array(GN);
 const HS = new Float32Array(N);                          // pressure at a liquid pixel from the weight of the liquid above it
-const P_MAX = 24, P_GRAD = 0.22, P_DAMP = 0.88, P_COMP = 0.8, P_DIFF = 0.12, P_LEAK = 0.997, P_VMAX = 3.5;
-const P_GDEN = 1.2, P_GAS = 0.6, P_LIQ = 0.6, P_BODY = 0.8, K_WIND = 0.1, P_LIFT = 0.1, P_K = 25;
+const FUa = new Float32Array(GN), FVa = new Float32Array(GN), FTa = new Float32Array(GX);   // flow summed over the sub-steps: what really moved this frame
+const FU = new Float32Array(GN), FV = new Float32Array(GN), FT = new Float32Array(GX), FXo = new Uint8Array(GN), FYo = new Uint8Array(GN), PRS = new Float32Array(GN);
+const PST = new Uint8Array(N);                           // how close each breakable wall pixel is to giving way (shown in the pressure view)
+const P_MAX = 24, P_SUB = 4, P_KG = 0.6, P_KC = 0.75, P_FDAMP = 0.95, P_FMAX = 12, P_LEAK = 0.9995, P_VMAX = 4;
+const L_AIRDRAG = 0.06, P_GDEN = 1.2, P_GAS = 1, P_LIQ = 0.6, P_BODY = 0.8, K_WIND = 0.1, P_LIFT = 0.1, P_K = 25;
+let pB0 = 0, pB1 = -1, pBj0 = 0, pBj1 = -1;              // the pressure working box (cells), so the gas transport only visits where pressure flows
 let presActive = false, hsActive = false, pxOn = false, pxLive = false, airMax2 = 0, pvMax2 = 0;
-function pressureStep(i0, i1, j0, j1) {
+function faceOpen(i0, i1, j0, j1) {
+  // which cell faces air can pass through, decided pixel by pixel: a 1px or diagonal wall seals a box completely
   for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
     const c = j * GX + i;
-    if (ASol[c]) { PR[c] = 0; PXv[c] = 0; PYv[c] = 0; PGX[c] = 0; PGY[c] = 0; continue; }
-    if (AEx[c] !== 0) PR[c] += AEx[c] * 1.5;
-    if (GDN[c] > P_GDEN) PR[c] += (GDN[c] - P_GDEN) * P_GAS;                       // gas squeezed together pushes back, so a vacuum fills up instead of packing gas without limit             // burning gas expands: a closed room fills with pressure
-    const p = PR[c];
-    const pl = i > 0 && !ASol[c - 1] ? PR[c - 1] : p, pr = i < GX - 1 && !ASol[c + 1] ? PR[c + 1] : p;
-    const pu = j > 0 ? (!ASol[c - GX] ? PR[c - GX] : p) : 0, pd = j < GY - 1 && !ASol[c + GX] ? PR[c + GX] : p;   // the sky above is pressure 0
-    const gx = (pl - pr) * 0.5, gy = (pu - pd) * 0.5;
-    PGX[c] = gx; PGY[c] = gy;
-    let vx = (PXv[c] + gx * P_GRAD) * P_DAMP, vy = (PYv[c] + gy * P_GRAD) * P_DAMP;
-    if (vx > P_VMAX) vx = P_VMAX; else if (vx < -P_VMAX) vx = -P_VMAX;
-    if (vy > P_VMAX) vy = P_VMAX; else if (vy < -P_VMAX) vy = -P_VMAX;
-    PXv[c] = vx; PYv[c] = vy;
+    if (i < GX - 1) {
+      let o = 0;
+      if (!ASol[c] && !ASol[c + 1]) { const a = (2 * j) * W + 2 * i + 1; o = (isAir(a) && isAir(a + 1)) || (isAir(a + W) && isAir(a + W + 1)) ? 1 : 0; }
+      FXo[c] = o;
+    }
+    if (j < GY - 1) {
+      let o = 0;
+      if (!ASol[c] && !ASol[c + GX]) { const a = (2 * j + 1) * W + 2 * i; o = (isAir(a) && isAir(a + W)) || (isAir(a + 1) && isAir(a + W + 1)) ? 1 : 0; }
+      FYo[c] = o;
+    }
   }
-  let pa = false;
+}
+function pressureStep(i0, i1, j0, j1) {
+  // compressible air on a staggered grid: pressure in the cells, flow on the faces between them. Pressure differences
+  // accelerate the flow, the flow moves pressure (exactly conserved), so a pressure wave travels at the speed of sound,
+  // a sealed room keeps its pressure and an opened one empties in a rush through the hole.
+  const fi0 = Math.max(0, i0 - 1), fj0 = Math.max(0, j0 - 1);
+  pB0 = i0; pB1 = i1; pBj0 = j0; pBj1 = j1;
+  faceOpen(fi0, i1, fj0, j1);
   for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
     const c = j * GX + i;
-    if (ASol[c]) { PDV[c] = 0; PR2[c] = 0; continue; }
-    const p = PR[c];
-    const xr = i < GX - 1 && !ASol[c + 1] ? PXv[c + 1] : 0, xl = i > 0 && !ASol[c - 1] ? PXv[c - 1] : 0;
-    const yd = j < GY - 1 && !ASol[c + GX] ? PYv[c + GX] : 0, yu = j > 0 ? (!ASol[c - GX] ? PYv[c - GX] : 0) : PYv[c];
-    const div = (xr - xl + yd - yu) * 0.5;
-    const pl = i > 0 && !ASol[c - 1] ? PR[c - 1] : p, pr = i < GX - 1 && !ASol[c + 1] ? PR[c + 1] : p;
-    const pu = j > 0 ? (!ASol[c - GX] ? PR[c - GX] : p) : 0, pd = j < GY - 1 && !ASol[c + GX] ? PR[c + GX] : p;
-    let q = (p - P_COMP * div + P_DIFF * (pl + pr + pu + pd - 4 * p)) * P_LEAK;
+    if (ASol[c]) { PR[c] = 0; continue; }
+    if (AEx[c] !== 0) PR[c] += AEx[c] * 1.5;                          // burning gas expands: a closed room fills with pressure
+    if (GDN[c] > P_GDEN) PR[c] += Math.min(8, (GDN[c] - P_GDEN) * P_GAS);          // gas squeezed together pushes back, so a vacuum fills up instead of packing gas without limit
+  }
+  const iE = Math.min(i1, GX - 2), jE = Math.min(j1, GY - 2);
+  for (let j = Math.max(0, j0 - 1); j <= j1; j++) for (let i = Math.max(0, i0 - 1); i <= i1; i++) { const c = j * GX + i; FUa[c] = 0; FVa[c] = 0; }
+  for (let i = i0; i <= i1; i++) FTa[i] = 0;
+  for (let s = 0; s < P_SUB; s++) {
+    for (let j = j0; j <= j1; j++) for (let i = fi0; i <= iE; i++) { const c = j * GX + i; let f = FXo[c] ? (FU[c] - P_KG * (PR[c + 1] - PR[c])) * P_FDAMP : 0; FU[c] = f > P_FMAX ? P_FMAX : f < -P_FMAX ? -P_FMAX : f; FUa[c] += FU[c]; }
+    for (let j = fj0; j <= jE; j++) for (let i = i0; i <= i1; i++) { const c = j * GX + i; let f = FYo[c] ? (FV[c] - P_KG * (PR[c + GX] - PR[c])) * P_FDAMP : 0; FV[c] = f > P_FMAX ? P_FMAX : f < -P_FMAX ? -P_FMAX : f; FVa[c] += FV[c]; }
+    if (j0 === 0) for (let i = i0; i <= i1; i++) { const f = ASol[i] ? 0 : (FT[i] - P_KG * PR[i]) * P_FDAMP; FT[i] = f > P_FMAX ? P_FMAX : f < -P_FMAX ? -P_FMAX : f; FTa[i] += FT[i]; }   // the open top: the sky is pressure 0
+    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+      const c = j * GX + i;
+      if (ASol[c]) continue;
+      PR[c] -= P_KC * (FU[c] - (i > 0 ? FU[c - 1] : 0) + FV[c] - (j > 0 ? FV[c - GX] : FT[i]));
+    }
+  }
+  let pa = false, m2 = 0, pv2 = 0;
+  const vs = GS * 0.5;
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const c = j * GX + i;
+    if (ASol[c]) { PR[c] = 0; PXv[c] = 0; PYv[c] = 0; continue; }
+    let q = PR[c] * P_LEAK;
     if (q > P_MAX) q = P_MAX; else if (q < -P_MAX) q = -P_MAX;
     if (q < 0.004 && q > -0.004) q = 0; else if (q > 0.05 || q < -0.05) pa = true;
-    PR2[c] = q; PDV[c] = div;
+    PR[c] = q;
+    let vx = (FUa[c] + (i > 0 ? FUa[c - 1] : 0)) * vs, vy = (FVa[c] + (j > 0 ? FVa[c - GX] : (j0 === 0 ? FTa[i] : 0))) * vs;
+    const sp2 = vx * vx + vy * vy;
+    if (sp2 > P_VMAX * P_VMAX) { const f = P_VMAX / Math.sqrt(sp2); vx *= f; vy *= f; }   // cap the speed, keep the direction
+    PXv[c] = vx; PYv[c] = vy;
   }
-  let m2 = 0, pv2 = 0;
+  // pressure as seen from inside solids/liquid cells (the air next to a thin wall, the surface of a pool): the open neighbours' average
   for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
     const c = j * GX + i;
-    PR[c] = PR2[c];
+    if (!ASol[c]) { PRS[c] = PR[c]; continue; }
+    let sm = 0, n = 0;
+    if (i > 0 && !ASol[c - 1]) { sm += PR[c - 1]; n++; } if (i < GX - 1 && !ASol[c + 1]) { sm += PR[c + 1]; n++; }
+    if (j > 0 && !ASol[c - GX]) { sm += PR[c - GX]; n++; } if (j < GY - 1 && !ASol[c + GX]) { sm += PR[c + GX]; n++; }
+    PRS[c] = n ? sm / n : 0;
+  }
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const c = j * GX + i;
+    PGX[c] = ((i > 0 ? PRS[c - 1] : PRS[c]) - (i < GX - 1 ? PRS[c + 1] : PRS[c])) * 0.5;
+    PGY[c] = ((j > 0 ? PRS[c - GX] : 0) - (j < GY - 1 ? PRS[c + GX] : PRS[c])) * 0.5;
     if (ASol[c]) continue;
     AX[c] += PXv[c]; AY[c] += PYv[c];                    // the pressure-driven flow joins the wind (undone at the start of the next solve)
     const s2 = AX[c] * AX[c] + AY[c] * AY[c]; if (s2 > m2) m2 = s2;
@@ -842,13 +880,24 @@ function pressureStep(i0, i1, j0, j1) {
   presActive = pa; airMax2 = m2; pvMax2 = pv2; pxOn = true; pxLive = pa || pv2 > 1e-5;
 }
 const SPL = [new Float32Array(N), new Float32Array(N), new Float32Array(N), new Float32Array(N), new Float32Array(N), new Float32Array(N)];
-const tmpT = new Float32Array(N), GDN = new Float32Array(GN);   // GDN: gas density per air cell (squeezed gas pushes back)
+const tmpT = new Float32Array(N), GDN = new Float32Array(GN), DVC = new Float32Array(GN);   // GDN: gas density per air cell (squeezed gas pushes back)
 function pressureTransport() {
   // The pressure-driven flow carries gas by moving its mass (every pixel hands its gas to the pixels it flows into), so the total never
   // changes: where the flow converges (a vacuum) the gas piles up, where it spreads (a pump) it thins out, and it only leaves through the open top.
-  for (let f = 0; f < 6; f++) SPL[f].fill(0);
+  const y0b = pBj0 * GS, y1b = Math.min(H, (pBj1 + 1) * GS), x0b = pB0 * GS, x1b = Math.min(W, (pB1 + 1) * GS);
+  if (y1b <= y0b) return;
+  for (let f = 0; f < 6; f++) SPL[f].fill(0, y0b * W, y1b * W);
   GDN.fill(0);
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+  tmpT.set(temp);
+  // how fast the flow spreads apart in each cell: a parcel of gas there expands and hands part of itself to its neighbours
+  for (let j = pBj0; j <= pBj1; j++) for (let i = pB0; i <= pB1; i++) {
+    const c = j * GX + i;
+    if (!gAct2[c] || ASol[c]) { DVC[c] = 0; continue; }
+    const xr = i < GX - 1 && !ASol[c + 1] ? PXv[c + 1] : PXv[c], xl = i > 0 && !ASol[c - 1] ? PXv[c - 1] : PXv[c];
+    const yd = j < GY - 1 && !ASol[c + GX] ? PYv[c + GX] : PYv[c], yu = j > 0 && !ASol[c - GX] ? PYv[c - GX] : PYv[c];
+    DVC[c] = (xr - xl + yd - yu) / (2 * GS);
+  }
+  for (let y = y0b; y < y1b; y++) for (let x = x0b; x < x1b; x++) {
     const i = y * W + x;
     if (!gAct2[CI[i]] || !isAir(i)) continue;
     const v0 = gS[i], v1 = gV[i], v2 = gM[i], v3 = gF[i], v4 = gK[i], v5 = gH[i];
@@ -857,28 +906,44 @@ function pressureTransport() {
     const ux = sampleCell(PXv, gx, gy), uy = sampleCell(PYv, gx, gy);
     const fx = x + ux, fy = y + uy;                                   // destination, measured on pixel centres
     const x0 = Math.floor(fx), y0 = Math.floor(fy), ax = fx - x0, ay = fy - y0;
+    const ns = Math.ceil(Math.max(ux < 0 ? -ux : ux, uy < 0 ? -uy : uy));
+    let blk = false;
+    for (let st = 1; st < ns; st++) {                                 // a fast jet must not jump a thin wall
+      const qx = Math.round(x + ux * st / ns), qy = Math.round(y + uy * st / ns);
+      if (qy < 0) break;
+      if (qx < 0 || qx >= W || qy >= H || !isAir(qy * W + qx)) { blk = true; break; }
+    }
+    if (blk) { SPL[0][i] += v0; SPL[1][i] += v1; SPL[2][i] += v2; SPL[3][i] += v3; SPL[4][i] += v4; SPL[5][i] += v5; continue; }
+    const dv = DVC[CI[i]], ex = dv > 0 ? (dv > 0.5 ? 0.5 : dv) : 0;
+    if (ex > 0.002) {                                                 // expansion: a quarter of the expanding share to each side of the destination
+      const rx = Math.round(fx), ry = Math.round(fy), e = ex * 0.25;
+      for (let q = 0; q < 4; q++) {
+        const cx = rx + DX[q], cy = ry + DY[q];
+        if (cy < 0) continue;
+        let t = i;
+        if (cx >= 0 && cx < W && cy < H && isAir(cy * W + cx)) t = cy * W + cx;
+        SPL[0][t] += e * v0; SPL[1][t] += e * v1; SPL[2][t] += e * v2; SPL[3][t] += e * v3; SPL[4][t] += e * v4; SPL[5][t] += e * v5;
+      }
+    }
+    const keep = 1 - ex;
     for (let q = 0; q < 4; q++) {
-      const w = ((q & 1) ? ax : 1 - ax) * ((q >> 1) ? ay : 1 - ay);
+      const w = ((q & 1) ? ax : 1 - ax) * ((q >> 1) ? ay : 1 - ay) * keep;
       if (w < 1e-5) continue;
       const cx = x0 + (q & 1), cy = y0 + (q >> 1);
       let t = i;
       if (cy < 0) continue;                                           // out of the open top: gone
       if (cx >= 0 && cx < W && cy < H) {
         const j = cy * W + cx;
-        if (isAir(j)) {
-          const mx = (x + cx) >> 1, my = (y + cy) >> 1;
-          if (type[my * W + mx] === 0 || isAir(my * W + mx)) t = j;    // not through a thin wall; a wall or the edge just stops the gas
-        }
+        if (isAir(j)) t = j;                                          // a wall or the edge just stops the gas
       }
       SPL[0][t] += w * v0; SPL[1][t] += w * v1; SPL[2][t] += w * v2; SPL[3][t] += w * v3; SPL[4][t] += w * v4; SPL[5][t] += w * v5;
     }
   }
-  tmpT.set(temp);
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+  for (let y = y0b; y < y1b; y++) for (let x = x0b; x < x1b; x++) {
     const i = y * W + x;
     if (!gAct2[CI[i]] || !isAir(i)) continue;
-    gS[i] = Math.min(30, SPL[0][i]); gV[i] = Math.min(30, SPL[1][i]); gM[i] = Math.min(30, SPL[2][i]);
-    gF[i] = Math.min(1.2, SPL[3][i]); gK[i] = Math.min(30, SPL[4][i]); gH[i] = Math.min(30, SPL[5][i]);
+    gS[i] = Math.min(60, SPL[0][i]); gV[i] = Math.min(60, SPL[1][i]); gM[i] = Math.min(60, SPL[2][i]);
+    gF[i] = Math.min(1.2, SPL[3][i]); gK[i] = Math.min(60, SPL[4][i]); gH[i] = Math.min(60, SPL[5][i]);
     GDN[CI[i]] += 0.25 * (gS[i] + gV[i] + gM[i] + gK[i] + gH[i]);
     const gx = (x + 0.5) / GS, gy = (y + 0.5) / GS;                    // warm / cold air is carried too (backtraced, it is not a mass)
     const ux = sampleCell(PXv, gx, gy), uy = sampleCell(PYv, gx, gy);
@@ -896,13 +961,26 @@ function pressureTransport() {
   }
 }
 function pressurePush() {
-  if (!presActive) return;
+  // air acts on liquid: pressure differences push it, and moving air (wind, a jet, a vacuum's pull) drags the surface and the spray.
+  // Both are divided by the liquid's density, so water whips up long before mercury does.
+  const drag = airMax2 > 0.25;
+  if (!presActive && !drag) return;
   for (let k = 0; k < np; k++) {
+    const xi = px[k] | 0, yi = py[k] | 0;
+    if (xi < 0 || yi < 0 || xi >= W || yi >= H) continue;
+    const ci = CI[yi * W + xi], deep = ASol[ci];
+    if (deep && PGX[ci] === 0 && PGY[ci] === 0) continue;             // deep inside the liquid: the air reaches neither it nor its neighbours
     const gx = px[k] / GS, gy = py[k] / GS;
-    const fx = sampleCell(PGX, gx, gy), fy = sampleCell(PGY, gx, gy);
-    if (fx === 0 && fy === 0) continue;
-    const m = P_LIQ / LQ_RHO[pk[k]];                    // a heavy liquid is harder to shove
-    pvx[k] += fx * m; pvy[k] += fy * m;
+    const rho = LQ_RHO[pk[k]];
+    if (presActive) {
+      const fx = sampleCell(PGX, gx, gy), fy = sampleCell(PGY, gx, gy);
+      if (fx !== 0 || fy !== 0) { const m = P_LIQ / rho; pvx[k] += fx * m; pvy[k] += fy * m; }
+    }
+    if (drag) {
+      if (deep) continue;                                             // under the surface the air can't reach it
+      const ax = sampleCell(AX, gx, gy), ay = sampleCell(AY, gx, gy), m = L_AIRDRAG / rho;
+      pvx[k] += (ax - pvx[k]) * m; pvy[k] += (ay - pvy[k]) * m;
+    }
   }
 }
 function hydroStep() {
@@ -940,8 +1018,8 @@ function airForce(cells, off, n, own, comX, comY, vx, vy) {
       const j = ny * W + nx;
       if (type[j] !== 0 || own(j) || isLiq(j)) continue;
       const ci = CI[j];
-      const ux = AX[ci] - PXv[ci] - vx, uy = AY[ci] - PYv[ci] - vy, un = ux * DX[q] + uy * DY[q];
-      let fn = -PR[ci] * P_BODY;
+      const ux = AX[ci] - vx, uy = AY[ci] - vy, un = ux * DX[q] + uy * DY[q];   // a jet of escaping air hits like wind
+      let fn = -PRS[ci] * P_BODY;
       if (un < 0) fn += K_WIND * un * Math.sqrt(ux * ux + uy * uy);
       fx += DX[q] * fn; fy += DY[q] * fn;
     }
@@ -992,13 +1070,13 @@ function axisLoad(x, y, dx, dy, t) {
   for (let xx = x - dx, yy = y - dy; ; xx -= dx, yy -= dy) {
     if (xx < 0 || yy < 0 || xx >= W || yy >= H) break;
     const j = yy * W + xx;
-    if (type[j] === 0) { a = PR[CI[j]] + HS[j]; break; }
+    if (type[j] === 0) { a = PRS[CI[j]] + HS[j]; break; }
     if (++na > 5) return 0;
   }
   for (let xx = x + dx, yy = y + dy; ; xx += dx, yy += dy) {
     if (xx < 0 || yy < 0 || xx >= W || yy >= H) break;
     const j = yy * W + xx;
-    if (type[j] === 0) { b = PR[CI[j]] + HS[j]; break; }
+    if (type[j] === 0) { b = PRS[CI[j]] + HS[j]; break; }
     if (++nb > 5) return 0;
   }
   const d = a - b, ad = d < 0 ? -d : d;
@@ -1010,11 +1088,13 @@ let pbDir = 0;
 function pressureBreak() {
   // pressure cracks what is too weak or too thin to hold it: glass and ice first, stone and brick only under blast-level pressure.
   // The pieces fly out toward the low-pressure side.
+  PST.fill(0);
   for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
     const c = y * W + x, t = type[c];
     if (t === 0 || KIND[t] !== 1 || STATIC[t] || !DEBRIS[t]) continue;
     const sx = axisLoad(x, y, 1, 0, t), dxs = pbDir, sy = axisLoad(x, y, 0, 1, t), dys = pbDir;
     const st = sx > sy ? sx : sy;
+    if (st > 0.3) PST[c] = st >= 1.5 ? 255 : st * 170;
     if (st <= 1) continue;
     hurt(c, Math.min(80, (st - 1) * 40));
     if (type[c] !== t && KIND[type[c]] === 2) {
@@ -1026,7 +1106,13 @@ function pressureBreak() {
 function overlayPressure() {
   const d = img.data;
   for (let i = 0; i < N; i++) {
-    const p = type[i] ? 0 : (HS[i] > 0 ? HS[i] : PR[CI[i]]);
+    if (type[i]) {                                       // breakable walls under strain glow yellow-orange: about to give way
+      const st = PST[i]; if (st < 40) continue;
+      const a = st / 255 * 0.75, o = i * 4;
+      d[o] += (255 - d[o]) * a; d[o + 1] += (190 - d[o + 1]) * a; d[o + 2] += (30 - d[o + 2]) * a;
+      continue;
+    }
+    const p = HS[i] > 0 ? HS[i] + PRS[CI[i]] : PRS[CI[i]];
     if (p < 0.08 && p > -0.08) continue;
     const ap = p < 0 ? -p : p;
     let a = Math.pow(ap, 0.7) * 0.22; if (a > 0.85) a = 0.85;
@@ -1059,7 +1145,7 @@ function sampleCell(a, gx, gy) {  // bilinear on cell centres of the coarse air 
 function airVelocity() {
   if (pxOn) { for (let c = 0; c < GN; c++) { AX[c] -= PXv[c]; AY[c] -= PYv[c]; } pxOn = false; }   // the incompressible solve sees only the wind; pressure flow is added back after it
   // what is solid for air: cells mostly filled by solids or liquid
-  let i0 = GX, i1 = -1, j0 = GY, j1 = -1, pAny = false;
+  let i0 = GX, i1 = -1, j0 = GY, j1 = -1, pi0 = GX, pi1 = -1, pj0 = GY, pj1 = -1;
   for (let j = 0; j < GY; j++) for (let i = 0; i < GX; i++) {
     const c = j * GX + i, p0 = j * GS * W + i * GS, p1 = p0 + 1, p2 = p0 + W, p3 = p2 + 1;
     let ts = 0, ss = 0, na = 0, ks = 0, hs = 0;
@@ -1073,18 +1159,23 @@ function airVelocity() {
     ASol[c] = sol >= 2 ? 1 : 0;                       // a 1px wall is still a wall for air
     ACT[c] = na ? ts / na : AMBIENT; ACS[c] = na ? ss / na : 0;
     // the air only needs solving where it moves or something drives it (heat, smoke, a blast)
-    if (!ASol[c] && (PR[c] > 0.02 || PR[c] < -0.02 || AEx[c] !== 0 || GDN[c] > P_GDEN)) pAny = true;
-    if (!ASol[c] && (Math.abs(AX[c]) + Math.abs(AY[c]) > 1e-3 || Math.abs(ACT[c] - AMBIENT) > 0.5 || ACS[c] > 1e-3 || ACK[c] > 1e-3 || ACH[c] > 1e-3 || AEx[c] !== 0 || PR[c] > 0.02 || PR[c] < -0.02 || GDN[c] > P_GDEN)) {
+    // pressure has its own working box (a pressure wave covers the whole map, the wind usually doesn't)
+    if (!ASol[c] && (PR[c] > 0.02 || PR[c] < -0.02 || AEx[c] !== 0 || GDN[c] > P_GDEN || PXv[c] !== 0 || PYv[c] !== 0)) {
+      if (i < pi0) pi0 = i; if (i > pi1) pi1 = i; if (j < pj0) pj0 = j; if (j > pj1) pj1 = j;
+    }
+    if (!ASol[c] && (Math.abs(AX[c]) + Math.abs(AY[c]) > 1e-3 || Math.abs(ACT[c] - AMBIENT) > 0.5 || ACS[c] > 1e-3 || ACK[c] > 1e-3 || ACH[c] > 1e-3 || AEx[c] !== 0)) {
       if (i < i0) i0 = i; if (i > i1) i1 = i; if (j < j0) j0 = j; if (j > j1) j1 = j;
     }
   }
-  if (i1 < 0) { AX.fill(0); AY.fill(0); AP.fill(0); if (pxLive || presActive) { PR.fill(0); PXv.fill(0); PYv.fill(0); PGX.fill(0); PGY.fill(0); PDV.fill(0); } presActive = false; pxLive = false; airMax2 = 0; pvMax2 = 0; return; }   // still air everywhere: nothing to do
+  if (i1 < 0 && pi1 < 0) { AX.fill(0); AY.fill(0); AP.fill(0); if (pxLive || presActive) { PR.fill(0); PXv.fill(0); PYv.fill(0); PGX.fill(0); PGY.fill(0); PDV.fill(0); FU.fill(0); FV.fill(0); FT.fill(0); PRS.fill(0); } presActive = false; pxLive = false; airMax2 = 0; pvMax2 = 0; return; }   // still air everywhere: nothing to do
+  if (i1 < 0) { AX.fill(0); AY.fill(0); AP.fill(0); }
+  else {
   const PAD = 10;
   i0 = Math.max(0, i0 - PAD); i1 = Math.min(GX - 1, i1 + PAD); j0 = Math.max(0, j0 - PAD); j1 = Math.min(GY - 1, j1 + PAD);
   // outside the working box the air is at rest
   for (let j = 0; j < GY; j++) for (let i = 0; i < GX; i++) {
     if (i >= i0 && i <= i1 && j >= j0 && j <= j1) continue;
-    const c = j * GX + i; AX[c] = 0; AY[c] = 0; AP[c] = 0; PR[c] = 0; PXv[c] = 0; PYv[c] = 0; PGX[c] = 0; PGY[c] = 0; PDV[c] = 0;
+    const c = j * GX + i; AX[c] = 0; AY[c] = 0; AP[c] = 0;
   }
   // forces: hot air rises, smoke is a little heavy, vorticity confinement keeps the swirls alive
   for (let j = Math.max(1, j0); j <= Math.min(GY - 2, j1); j++) for (let i = Math.max(1, i0); i <= Math.min(GX - 2, i1); i++) {
@@ -1094,7 +1185,7 @@ function airVelocity() {
   for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
     const c = j * GX + i;
     if (ASol[c]) { AX[c] = 0; AY[c] = 0; continue; }
-    AY[c] -= A_BUOY * (ACT[c] - AMBIENT) - A_SMOKEW * ACS[c] - 0.08 * Math.min(ACK[c], 3) + 0.02 * ACH[c];   // CO2 sinks and pools, hydrogen shoots up
+    AY[c] -= A_BUOY * (ACT[c] - AMBIENT) - A_SMOKEW * Math.min(ACS[c], 1.2) - 0.08 * Math.min(ACK[c], 3) + 0.02 * ACH[c];   // CO2 sinks and pools, hydrogen shoots up
     if (i > 1 && i < GX - 2 && j > 1 && j < GY - 2 && i > i0 && i < i1 && j > j0 && j < j1) {
       let nx = (Math.abs(AVort[c + 1]) - Math.abs(AVort[c - 1])) * 0.5, ny = (Math.abs(AVort[c + GX]) - Math.abs(AVort[c - GX])) * 0.5;
       const l = Math.sqrt(nx * nx + ny * ny) + 1e-5; nx /= l; ny /= l;
@@ -1141,13 +1232,26 @@ function airVelocity() {
     const s2 = AX[c] * AX[c] + AY[c] * AY[c];
     if (s2 > A_VMAX * A_VMAX) { const f = A_VMAX / Math.sqrt(s2); AX[c] *= f; AY[c] *= f; }
   }
-  if (pAny || presActive || pxLive) pressureStep(i0, i1, j0, j1);
-  else { airMax2 = 0; pvMax2 = 0; }
+  }
+  if (pi1 >= 0) {
+    const PP = 12;
+    pi0 = Math.max(0, pi0 - PP); pi1 = Math.min(GX - 1, pi1 + PP); pj0 = Math.max(0, pj0 - PP); pj1 = Math.min(GY - 1, pj1 + PP);
+    for (let j = 0; j < GY; j++) for (let i = 0; i < GX; i++) {
+      if (i >= pi0 && i <= pi1 && j >= pj0 && j <= pj1) continue;
+      const c = j * GX + i; PR[c] = 0; PXv[c] = 0; PYv[c] = 0; PGX[c] = 0; PGY[c] = 0; FU[c] = 0; FV[c] = 0; PRS[c] = 0; if (j === 0) FT[i] = 0;
+    }
+    pressureStep(pi0, pi1, pj0, pj1);
+  } else {
+    if (pxLive) { PR.fill(0); PXv.fill(0); PYv.fill(0); PGX.fill(0); PGY.fill(0); FU.fill(0); FV.fill(0); FT.fill(0); PRS.fill(0); }
+    presActive = false; pxLive = false; pvMax2 = 0;
+    let m2 = 0; for (let c = 0; c < GN; c++) { const s2 = AX[c] * AX[c] + AY[c] * AY[c]; if (s2 > m2) m2 = s2; } airMax2 = m2;
+  }
 }
 const advIn = [gS, gV, gM, gF, gK, gH, temp], ADV_T = 6;
 const advTmp = advIn.map(() => new Float32Array(N));
 const advAcc = new Float32Array(advIn.length);
 const gAct = new Uint8Array(GN), gAct2 = new Uint8Array(GN);
+let advF0 = 0;                                          // first field the backtrace advection handles (gas skips it while pressure moves it by mass)
 let gasIdle = false;                                    // true when advectGases found no gas, flame or hot air anywhere this frame
 function advectGases() {
   // only the parts of the air that hold gas, flame or heat (plus a margin the flow can reach this frame) need work
@@ -1170,7 +1274,7 @@ function advectGases() {
     for (let dj = -3; dj <= 3; dj++) { const jj = j + dj; if (jj < 0 || jj >= GY) continue;
       for (let dk = -3; dk <= 3; dk++) { const kk = k + dk; if (kk >= 0 && kk < GX) gAct2[jj * GX + kk] = 1; } }
   }
-  for (let f = 0; f < advIn.length; f++) advTmp[f].set(advIn[f]);
+  for (let f = advF0; f < advIn.length; f++) advTmp[f].set(advIn[f]);
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     const i = y * W + x;
     if (!gAct2[((y / GS) | 0) * GX + ((x / GS) | 0)]) continue;
@@ -1192,10 +1296,10 @@ function advectGases() {
       const mx = (x + cx) >> 1, my = (y + cy) >> 1;                     // don't pull gas through a thin wall
       if (my >= 0 && !isAir(my * W + mx) && type[my * W + mx] !== 0) continue;
       w0 += w;
-      for (let f = 0; f < advIn.length; f++) advAcc[f] += w * advTmp[f][j];
+      for (let f = advF0; f < advIn.length; f++) advAcc[f] += w * advTmp[f][j];
     }
     if (w0 < 1e-4) continue;
-    for (let f = 0; f < advIn.length; f++) advIn[f][i] = advAcc[f] / w0;
+    for (let f = advF0; f < advIn.length; f++) advIn[f][i] = advAcc[f] / w0;
   }
 }
 function gasChemistry() {
@@ -1248,16 +1352,18 @@ function gasChemistry() {
 }
 function airStep() {
   airVelocity();
+  // the wind carries gas and heat as before; the pressure-driven part of the flow then moves the gas by mass (exactly
+  // conserved: a vacuum gathers it, a pump spreads it, an opened tank blows it out) and carries the heat along
   const pf = pxOn && pvMax2 > 4e-4;
-  if (pf) for (let c = 0; c < GN; c++) { AX[c] -= PXv[c]; AY[c] -= PYv[c]; }       // the wind carries the gas first,
+  if (pf) for (let c = 0; c < GN; c++) { AX[c] -= PXv[c]; AY[c] -= PYv[c]; }
   advectGases();
   if (pf) {
     for (let c = 0; c < GN; c++) { AX[c] += PXv[c]; AY[c] += PYv[c]; }
-    if (!gasIdle) pressureTransport();                                              // then the pressure flow moves it, conserving it
+    if (!gasIdle) pressureTransport();
   }
   gasChemistry();
   if ((frame & 1) === 0) { hydroStep(); airLift(); }
-  if (frame % 3 === 1 && (presActive || hsActive)) pressureBreak();
+  if (frame % 3 === 1) { if (presActive || hsActive) pressureBreak(); else if (PST[0] !== 0 || frame % 30 === 1) PST.fill(0); }
 }
 function addHeatFlame(i, T, flame, smoke) {
   if (!isAir(i)) return;
@@ -3516,7 +3622,7 @@ function clearAll() {
     return;
   }
   dmg.fill(0); soot.fill(0); grp.fill(0); held.fill(0); ng = 0; RBS.length = 0; rbOwner.fill(0); type.fill(0); temp.fill(AMBIENT); life.fill(0); vel.fill(0); hv.fill(0); lOcc.fill(0); lKind.fill(-1); np = 0;
-  gS.fill(0); gV.fill(0); gM.fill(0); gF.fill(0); gC.fill(0); gK.fill(0); gH.fill(0); AX.fill(0); AY.fill(0); AP.fill(0); PR.fill(0); PXv.fill(0); PYv.fill(0); PGX.fill(0); PGY.fill(0); PDV.fill(0); HS.fill(0); pxOn = false; presActive = false; hsActive = false; }
+  gS.fill(0); gV.fill(0); gM.fill(0); gF.fill(0); gC.fill(0); gK.fill(0); gH.fill(0); AX.fill(0); AY.fill(0); AP.fill(0); PR.fill(0); PXv.fill(0); PYv.fill(0); PGX.fill(0); PGY.fill(0); PDV.fill(0); HS.fill(0); FU.fill(0); FV.fill(0); FT.fill(0); PRS.fill(0); PST.fill(0); pxOn = false; presActive = false; hsActive = false; }
 
 function cellAt(e) {
   const r = cv.getBoundingClientRect();
@@ -3547,7 +3653,7 @@ function toolPaint(x, y) {
       if (i < 0 || j < 0 || i >= GX || j >= GY) continue;
       const dd = ((i - gx0) ** 2 + (j - gy0) ** 2) / (gr * gr), c = j * GX + i;
       if (dd > 1 || ASol[c]) continue;
-      PR[c] = Math.max(-P_MAX, Math.min(P_MAX, PR[c] + g * 0.9 * (1 - dd)));
+      PR[c] = Math.max(-P_MAX, Math.min(P_MAX, PR[c] + g * 2 * (1 - dd)));
     }
     // liquid fills its air cells, so it has no pressure cell of its own: it feels the same pressure bump directly (heavy liquids move less)
     const reach = gr * GS + 3, rr2 = reach * reach;
@@ -4007,7 +4113,7 @@ function frameBody(now) {
     else if (gH[i] > 0.05) nm = 'Hydrogen';
     else if (gK[i] > 0.05) nm = 'CO2';
     $('iEl').textContent = nm;
-    const pv = (type[i] ? 0 : (HS[i] > 0 ? HS[i] : PR[CI[i]])) * 10;
+    const pv = (type[i] ? 0 : HS[i] + PRS[CI[i]]) * 10;
     $('iT').textContent = temp[i].toFixed(0) + ' °C' + (pv > 0.5 || pv < -0.5 ? ' · ' + pv.toFixed(0) + ' kPa' : '');
   }
   if ((frame & 15) === 0) {
