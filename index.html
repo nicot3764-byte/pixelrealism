@@ -183,6 +183,7 @@
   </div>
   <div id="mMenu">
     <button id="mStep">step once</button>
+    <button id="mPres">pressure view</button>
     <button id="mNet">play together</button>
     <button id="mOrient">portrait</button>
     <div class="mstats"><span>fps <b id="mF">0</b></span><span>n <b id="mN">0</b></span><span>quality <b id="mQ">full</b></span></div>
@@ -195,6 +196,7 @@
     <button class="tb" id="bClear" title="Clear everything  [C]">clear</button>
     <button class="tb erase" id="bErase" title="Erase while drawing (for touch screens)  [X]">erase</button>
     <button class="tb" id="bHeat" title="Temperature view  [T]">heat</button>
+    <button class="tb" id="bPres" title="Pressure view: red = pressure, blue = suction, deep liquid = pressure  [V]">pressure</button>
     <button class="tb on" id="bLight" title="Lighting and shadows  [L]">light</button>
     <button class="tb" id="bOrient" title="Portrait / landscape canvas  [P]">portrait</button>
     <button class="tb" id="bNet" title="Draw on the same canvas as a friend">together</button>
@@ -667,6 +669,7 @@ function separate() {
   }
 }
 function liquidPhysics() {
+  pressurePush();
   // drop any particle whose numbers went bad: a single NaN would spread through the grid and stall every liquid on the map
   for (let k = np - 1; k >= 0; k--) {
     if (!(px[k] >= -50 && px[k] < W + 50 && py[k] >= -50 && py[k] < H + 50 && pvx[k] === pvx[k] && pvy[k] === pvy[k] && pt[k] === pt[k])) removeP(k);
@@ -784,6 +787,264 @@ const AVort = new Float32Array(GN);
 const AEx = new Float32Array(GN), gIgn = new Uint8Array(N), ACK = new Float32Array(GN), ACH = new Float32Array(GN);          // gas expansion from combustion this frame (pushes the air outward: whoomph)
 const A_BUOY = 0.0014, A_SMOKEW = 0.004, A_VORT = 0.1, A_ITERS = 14, A_VMAX = 4, A_SOR = 1.6;
 function isAir(i) { return type[i] === 0 && lOcc[i] === 0; }
+// ======================= pressure =======================
+// A real pressure field on the air grid. Pressure pushes air down its gradient (a damped pressure wave: it spreads, bounces off
+// walls, leaks out of the open top and slowly relaxes), and the flow it drives carries smoke and gas. Gas is conserved: where the
+// flow converges (a vacuum) the gas piles up, where it diverges (a pump) it thins out. The same field pushes liquid, grains, bodies
+// (force = pressure x exposed face, so size matters; acceleration = force / mass, so weight matters) and breaks thin walls.
+// Liquid adds its own weight: pressure under a liquid grows with depth (HS).
+const PR = new Float32Array(GN), PR2 = new Float32Array(GN), PXv = new Float32Array(GN), PYv = new Float32Array(GN);
+const PGX = new Float32Array(GN), PGY = new Float32Array(GN), PDV = new Float32Array(GN);
+const HS = new Float32Array(N);                          // pressure at a liquid pixel from the weight of the liquid above it
+const P_MAX = 24, P_GRAD = 0.22, P_DAMP = 0.88, P_COMP = 0.8, P_DIFF = 0.12, P_LEAK = 0.997, P_VMAX = 3.5;
+const P_GDEN = 1.2, P_GAS = 0.6, P_LIQ = 0.6, P_BODY = 0.8, K_WIND = 0.1, P_LIFT = 0.1, P_K = 25;
+let presActive = false, hsActive = false, pxOn = false, pxLive = false, airMax2 = 0, pvMax2 = 0;
+function pressureStep(i0, i1, j0, j1) {
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const c = j * GX + i;
+    if (ASol[c]) { PR[c] = 0; PXv[c] = 0; PYv[c] = 0; PGX[c] = 0; PGY[c] = 0; continue; }
+    if (AEx[c] !== 0) PR[c] += AEx[c] * 1.5;
+    if (GDN[c] > P_GDEN) PR[c] += (GDN[c] - P_GDEN) * P_GAS;                       // gas squeezed together pushes back, so a vacuum fills up instead of packing gas without limit             // burning gas expands: a closed room fills with pressure
+    const p = PR[c];
+    const pl = i > 0 && !ASol[c - 1] ? PR[c - 1] : p, pr = i < GX - 1 && !ASol[c + 1] ? PR[c + 1] : p;
+    const pu = j > 0 ? (!ASol[c - GX] ? PR[c - GX] : p) : 0, pd = j < GY - 1 && !ASol[c + GX] ? PR[c + GX] : p;   // the sky above is pressure 0
+    const gx = (pl - pr) * 0.5, gy = (pu - pd) * 0.5;
+    PGX[c] = gx; PGY[c] = gy;
+    let vx = (PXv[c] + gx * P_GRAD) * P_DAMP, vy = (PYv[c] + gy * P_GRAD) * P_DAMP;
+    if (vx > P_VMAX) vx = P_VMAX; else if (vx < -P_VMAX) vx = -P_VMAX;
+    if (vy > P_VMAX) vy = P_VMAX; else if (vy < -P_VMAX) vy = -P_VMAX;
+    PXv[c] = vx; PYv[c] = vy;
+  }
+  let pa = false;
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const c = j * GX + i;
+    if (ASol[c]) { PDV[c] = 0; PR2[c] = 0; continue; }
+    const p = PR[c];
+    const xr = i < GX - 1 && !ASol[c + 1] ? PXv[c + 1] : 0, xl = i > 0 && !ASol[c - 1] ? PXv[c - 1] : 0;
+    const yd = j < GY - 1 && !ASol[c + GX] ? PYv[c + GX] : 0, yu = j > 0 ? (!ASol[c - GX] ? PYv[c - GX] : 0) : PYv[c];
+    const div = (xr - xl + yd - yu) * 0.5;
+    const pl = i > 0 && !ASol[c - 1] ? PR[c - 1] : p, pr = i < GX - 1 && !ASol[c + 1] ? PR[c + 1] : p;
+    const pu = j > 0 ? (!ASol[c - GX] ? PR[c - GX] : p) : 0, pd = j < GY - 1 && !ASol[c + GX] ? PR[c + GX] : p;
+    let q = (p - P_COMP * div + P_DIFF * (pl + pr + pu + pd - 4 * p)) * P_LEAK;
+    if (q > P_MAX) q = P_MAX; else if (q < -P_MAX) q = -P_MAX;
+    if (q < 0.004 && q > -0.004) q = 0; else if (q > 0.05 || q < -0.05) pa = true;
+    PR2[c] = q; PDV[c] = div;
+  }
+  let m2 = 0, pv2 = 0;
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const c = j * GX + i;
+    PR[c] = PR2[c];
+    if (ASol[c]) continue;
+    AX[c] += PXv[c]; AY[c] += PYv[c];                    // the pressure-driven flow joins the wind (undone at the start of the next solve)
+    const s2 = AX[c] * AX[c] + AY[c] * AY[c]; if (s2 > m2) m2 = s2;
+    const q2 = PXv[c] * PXv[c] + PYv[c] * PYv[c]; if (q2 > pv2) pv2 = q2;
+  }
+  presActive = pa; airMax2 = m2; pvMax2 = pv2; pxOn = true; pxLive = pa || pv2 > 1e-5;
+}
+const SPL = [new Float32Array(N), new Float32Array(N), new Float32Array(N), new Float32Array(N), new Float32Array(N), new Float32Array(N)];
+const tmpT = new Float32Array(N), GDN = new Float32Array(GN);   // GDN: gas density per air cell (squeezed gas pushes back)
+function pressureTransport() {
+  // The pressure-driven flow carries gas by moving its mass (every pixel hands its gas to the pixels it flows into), so the total never
+  // changes: where the flow converges (a vacuum) the gas piles up, where it spreads (a pump) it thins out, and it only leaves through the open top.
+  for (let f = 0; f < 6; f++) SPL[f].fill(0);
+  GDN.fill(0);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x;
+    if (!gAct2[CI[i]] || !isAir(i)) continue;
+    const v0 = gS[i], v1 = gV[i], v2 = gM[i], v3 = gF[i], v4 = gK[i], v5 = gH[i];
+    if (v0 + v1 + v2 + v3 + v4 + v5 < 1e-6) continue;
+    const gx = (x + 0.5) / GS, gy = (y + 0.5) / GS;
+    const ux = sampleCell(PXv, gx, gy), uy = sampleCell(PYv, gx, gy);
+    const fx = x + ux, fy = y + uy;                                   // destination, measured on pixel centres
+    const x0 = Math.floor(fx), y0 = Math.floor(fy), ax = fx - x0, ay = fy - y0;
+    for (let q = 0; q < 4; q++) {
+      const w = ((q & 1) ? ax : 1 - ax) * ((q >> 1) ? ay : 1 - ay);
+      if (w < 1e-5) continue;
+      const cx = x0 + (q & 1), cy = y0 + (q >> 1);
+      let t = i;
+      if (cy < 0) continue;                                           // out of the open top: gone
+      if (cx >= 0 && cx < W && cy < H) {
+        const j = cy * W + cx;
+        if (isAir(j)) {
+          const mx = (x + cx) >> 1, my = (y + cy) >> 1;
+          if (type[my * W + mx] === 0 || isAir(my * W + mx)) t = j;    // not through a thin wall; a wall or the edge just stops the gas
+        }
+      }
+      SPL[0][t] += w * v0; SPL[1][t] += w * v1; SPL[2][t] += w * v2; SPL[3][t] += w * v3; SPL[4][t] += w * v4; SPL[5][t] += w * v5;
+    }
+  }
+  tmpT.set(temp);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x;
+    if (!gAct2[CI[i]] || !isAir(i)) continue;
+    gS[i] = Math.min(30, SPL[0][i]); gV[i] = Math.min(30, SPL[1][i]); gM[i] = Math.min(30, SPL[2][i]);
+    gF[i] = Math.min(1.2, SPL[3][i]); gK[i] = Math.min(30, SPL[4][i]); gH[i] = Math.min(30, SPL[5][i]);
+    GDN[CI[i]] += 0.25 * (gS[i] + gV[i] + gM[i] + gK[i] + gH[i]);
+    const gx = (x + 0.5) / GS, gy = (y + 0.5) / GS;                    // warm / cold air is carried too (backtraced, it is not a mass)
+    const ux = sampleCell(PXv, gx, gy), uy = sampleCell(PYv, gx, gy);
+    if (ux * ux + uy * uy < 1e-4) continue;
+    const sx = x - ux, sy = y - uy, x0 = Math.floor(sx), y0 = Math.floor(sy), ax = sx - x0, ay = sy - y0;
+    let acc = 0, w0 = 0;
+    for (let q = 0; q < 4; q++) {
+      const cx = x0 + (q & 1), cy = y0 + (q >> 1), w = ((q & 1) ? ax : 1 - ax) * ((q >> 1) ? ay : 1 - ay);
+      if (cy < 0) { w0 += w; acc += w * AMBIENT; continue; }
+      if (cx < 0 || cx >= W || cy >= H) continue;
+      const j = cy * W + cx; if (!isAir(j)) continue;
+      w0 += w; acc += w * tmpT[j];
+    }
+    if (w0 > 1e-4) temp[i] = acc / w0;
+  }
+}
+function pressurePush() {
+  if (!presActive) return;
+  for (let k = 0; k < np; k++) {
+    const gx = px[k] / GS, gy = py[k] / GS;
+    const fx = sampleCell(PGX, gx, gy), fy = sampleCell(PGY, gx, gy);
+    if (fx === 0 && fy === 0) continue;
+    const m = P_LIQ / LQ_RHO[pk[k]];                    // a heavy liquid is harder to shove
+    pvx[k] += fx * m; pvy[k] += fy * m;
+  }
+}
+function hydroStep() {
+  // the weight of the liquid above every liquid pixel (density x gravity x depth); liquid that is connected sideways shares it
+  if (np === 0) { if (hsActive) { HS.fill(0); hsActive = false; } return; }
+  hsActive = true;
+  for (let x = 0; x < W; x++) {
+    let acc = 0, rho = 1;
+    for (let y = 0; y < H; y++) {
+      const c = y * W + x;
+      if (type[c] === 0 && (lOcc[c] > 0 || cTyp[(y >> 1) * GX + (x >> 1)] === 1)) {
+        if (lOcc[c] > 0 && lKind[c] >= 0) rho = LQ_RHO[lKind[c]];
+        acc += rho * RB_G; HS[c] = acc;
+      } else { acc = 0; rho = 1; HS[c] = 0; }
+    }
+  }
+  for (let y = 0; y < H; y++) {
+    const r = y * W; let run = 0;
+    for (let x = 0; x < W; x++) { const v = HS[r + x]; if (v > 0) { if (v < run) HS[r + x] = run; else run = v; } else run = 0; }
+    run = 0;
+    for (let x = W - 1; x >= 0; x--) { const v = HS[r + x]; if (v > 0) { if (v < run) HS[r + x] = run; else run = v; } else run = 0; }
+  }
+}
+const AF = { fx: 0, fy: 0, tau: 0 };
+function airForce(cells, off, n, own, comX, comY, vx, vy) {
+  // pressure on every exposed face of a body (more surface = more push) plus the wind's push on the faces it hits
+  AF.fx = 0; AF.fy = 0; AF.tau = 0;
+  if (!presActive && airMax2 < 0.25) return;
+  for (let m = off; m < off + n; m++) {
+    const c = cells[m], x = c % W, y = (c / W) | 0;
+    let fx = 0, fy = 0;
+    for (let q = 0; q < 4; q++) {
+      const nx = x + DX[q], ny = y + DY[q];
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      const j = ny * W + nx;
+      if (type[j] !== 0 || own(j) || isLiq(j)) continue;
+      const ci = CI[j];
+      const ux = AX[ci] - PXv[ci] - vx, uy = AY[ci] - PYv[ci] - vy, un = ux * DX[q] + uy * DY[q];
+      let fn = -PR[ci] * P_BODY;
+      if (un < 0) fn += K_WIND * un * Math.sqrt(ux * ux + uy * uy);
+      fx += DX[q] * fn; fy += DY[q] * fn;
+    }
+    AF.fx += fx; AF.fy += fy; AF.tau += (x + 0.5 - comX) * fy - (y + 0.5 - comY) * fx;
+  }
+}
+function airKick(s0, n, M) {
+  // a resting piece is shoved loose when the air's push beats its friction (or its weight, for lift)
+  if (!presActive && airMax2 < 0.25) return false;
+  let cx = 0, cy = 0;
+  for (let m = s0; m < s0 + n; m++) { const c = bCells[m]; cx += c % W; cy += (c / W) | 0; }
+  cx = cx / n + 0.5; cy = cy / n + 0.5;
+  const lab = bLabel[bCells[s0]];
+  airForce(bCells, s0, n, j => bLabel[j] === lab, cx, cy, 0, 0);
+  const wgt = M * RB_G;
+  if (Math.abs(AF.fx) < 0.6 * wgt && AF.fy > -wgt) return false;
+  wakeBody(s0, n, AF.fx / M * 3, Math.min(0, AF.fy + wgt) / M * 3);
+  return true;
+}
+function airLift() {
+  // loose material that sits in a strong draught is blown off the pile: light, fluffy things (ash, snow, sawdust) go first, sand needs a gale
+  if (airMax2 < 1) return;
+  let budget = 120;
+  for (let c = 0; c < GN && budget > 0; c++) {
+    if (ASol[c]) continue;
+    const vx = AX[c], vy = AY[c], s2 = vx * vx + vy * vy;
+    if (s2 < 1) continue;
+    const p0 = (c / GX | 0) * GS * W + (c % GX) * GS;
+    for (let q = 0; q < 4; q++) {
+      const pix = p0 + (q & 1) + (q >> 1) * W, t = type[pix];
+      if (t === 0 || KIND[t] !== 2 || DRAG[t] * s2 < P_LIFT || Math.random() > 0.3) continue;
+      if (toGrain(pix, vx * 0.7, vy * 0.7 - 0.3)) budget--;
+    }
+  }
+}
+function pressureBurst(x, y, R, power) {
+  const gr = Math.ceil(R / GS), gx0 = (x / GS) | 0, gy0 = (y / GS) | 0;
+  for (let j = gy0 - gr; j <= gy0 + gr; j++) for (let i = gx0 - gr; i <= gx0 + gr; i++) {
+    if (i < 0 || j < 0 || i >= GX || j >= GY) continue;
+    const d = Math.sqrt((i - gx0) ** 2 + (j - gy0) ** 2) / gr, c = j * GX + i;
+    if (d > 1 || ASol[c]) continue;
+    PR[c] = Math.min(P_MAX, PR[c] + power * 1.2 * (1 - d));
+  }
+}
+function axisLoad(x, y, dx, dy, t) {
+  // stress on a wall pixel along one axis: the pressure difference across the wall over its resistance (stronger material, thicker wall = more)
+  let a = 0, b = 0, na = 0, nb = 0;
+  for (let xx = x - dx, yy = y - dy; ; xx -= dx, yy -= dy) {
+    if (xx < 0 || yy < 0 || xx >= W || yy >= H) break;
+    const j = yy * W + xx;
+    if (type[j] === 0) { a = PR[CI[j]] + HS[j]; break; }
+    if (++na > 5) return 0;
+  }
+  for (let xx = x + dx, yy = y + dy; ; xx += dx, yy += dy) {
+    if (xx < 0 || yy < 0 || xx >= W || yy >= H) break;
+    const j = yy * W + xx;
+    if (type[j] === 0) { b = PR[CI[j]] + HS[j]; break; }
+    if (++nb > 5) return 0;
+  }
+  const d = a - b, ad = d < 0 ? -d : d;
+  if (ad < 0.5) return 0;
+  pbDir = d > 0 ? 1 : -1;
+  return ad / (STRENGTH[t] * (na + nb + 1) * P_K);
+}
+let pbDir = 0;
+function pressureBreak() {
+  // pressure cracks what is too weak or too thin to hold it: glass and ice first, stone and brick only under blast-level pressure.
+  // The pieces fly out toward the low-pressure side.
+  for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+    const c = y * W + x, t = type[c];
+    if (t === 0 || KIND[t] !== 1 || STATIC[t] || !DEBRIS[t]) continue;
+    const sx = axisLoad(x, y, 1, 0, t), dxs = pbDir, sy = axisLoad(x, y, 0, 1, t), dys = pbDir;
+    const st = sx > sy ? sx : sy;
+    if (st <= 1) continue;
+    hurt(c, Math.min(80, (st - 1) * 40));
+    if (type[c] !== t && KIND[type[c]] === 2) {
+      const sp = (0.5 + Math.min(3, st) * 0.5) * Math.sqrt(2.5 / RHO[t]);
+      if (sx > sy) toGrain(c, dxs * sp, -0.2 + (Math.random() - 0.5) * 0.4); else toGrain(c, (Math.random() - 0.5) * 0.4, dys * sp);
+    }
+  }
+}
+function overlayPressure() {
+  const d = img.data;
+  for (let i = 0; i < N; i++) {
+    const p = type[i] ? 0 : (HS[i] > 0 ? HS[i] : PR[CI[i]]);
+    if (p < 0.08 && p > -0.08) continue;
+    const ap = p < 0 ? -p : p;
+    let a = Math.pow(ap, 0.7) * 0.22; if (a > 0.85) a = 0.85;
+    const o = i * 4;
+    if (p > 0) { d[o] += (255 - d[o]) * a; d[o + 1] += (60 - d[o + 1]) * a; d[o + 2] += (40 - d[o + 2]) * a; }
+    else { d[o] += (50 - d[o]) * a; d[o + 1] += (110 - d[o + 1]) * a; d[o + 2] += (255 - d[o + 2]) * a; }
+  }
+  // legend: blue (suction) - neutral - red (pressure)
+  for (let k = 0; k < 49; k++) {
+    const v = (k - 24) / 24 * 7, ap = Math.abs(v), a = Math.min(0.85, Math.pow(ap, 0.7) * 0.22);
+    for (let yy = H - 7; yy <= H - 5; yy++) {
+      const o = (yy * W + 4 + k) * 4;
+      d[o] = 24 + ((v > 0 ? 255 : 50) - 24) * a; d[o + 1] = 24 + ((v > 0 ? 60 : 110) - 24) * a; d[o + 2] = 24 + ((v > 0 ? 40 : 255) - 24) * a; d[o + 3] = 255;
+    }
+  }
+  for (let yy = H - 8; yy <= H - 4; yy += 4) for (let k = 0; k < 49; k++) { const o = (yy * W + 4 + k) * 4; d[o] = d[o + 1] = d[o + 2] = 120; d[o + 3] = 255; }
+  for (let yy = H - 7; yy <= H - 5; yy++) { const o = (yy * W + 28) * 4; d[o] = d[o + 1] = d[o + 2] = 200; }
+}
 function airAbove(c) {            // nearest air pixel straight up (used when gas is born inside a liquid)
   for (let y = (c / W) | 0, x = c % W, d = 0; y >= 0 && d < 60; y--, d++) { const j = y * W + x; if (type[j] !== 0) return -1; if (!lOcc[j]) return j; }
   return -1;
@@ -796,8 +1057,9 @@ function sampleCell(a, gx, gy) {  // bilinear on cell centres of the coarse air 
   return (a[c] * (1 - ax) + a[c + 1] * ax) * (1 - ay) + (a[c + GX] * (1 - ax) + a[c + GX + 1] * ax) * ay;
 }
 function airVelocity() {
+  if (pxOn) { for (let c = 0; c < GN; c++) { AX[c] -= PXv[c]; AY[c] -= PYv[c]; } pxOn = false; }   // the incompressible solve sees only the wind; pressure flow is added back after it
   // what is solid for air: cells mostly filled by solids or liquid
-  let i0 = GX, i1 = -1, j0 = GY, j1 = -1;
+  let i0 = GX, i1 = -1, j0 = GY, j1 = -1, pAny = false;
   for (let j = 0; j < GY; j++) for (let i = 0; i < GX; i++) {
     const c = j * GX + i, p0 = j * GS * W + i * GS, p1 = p0 + 1, p2 = p0 + W, p3 = p2 + 1;
     let ts = 0, ss = 0, na = 0, ks = 0, hs = 0;
@@ -811,17 +1073,18 @@ function airVelocity() {
     ASol[c] = sol >= 2 ? 1 : 0;                       // a 1px wall is still a wall for air
     ACT[c] = na ? ts / na : AMBIENT; ACS[c] = na ? ss / na : 0;
     // the air only needs solving where it moves or something drives it (heat, smoke, a blast)
-    if (!ASol[c] && (Math.abs(AX[c]) + Math.abs(AY[c]) > 1e-3 || Math.abs(ACT[c] - AMBIENT) > 0.5 || ACS[c] > 1e-3 || ACK[c] > 1e-3 || ACH[c] > 1e-3 || AEx[c] !== 0)) {
+    if (!ASol[c] && (PR[c] > 0.02 || PR[c] < -0.02 || AEx[c] !== 0 || GDN[c] > P_GDEN)) pAny = true;
+    if (!ASol[c] && (Math.abs(AX[c]) + Math.abs(AY[c]) > 1e-3 || Math.abs(ACT[c] - AMBIENT) > 0.5 || ACS[c] > 1e-3 || ACK[c] > 1e-3 || ACH[c] > 1e-3 || AEx[c] !== 0 || PR[c] > 0.02 || PR[c] < -0.02 || GDN[c] > P_GDEN)) {
       if (i < i0) i0 = i; if (i > i1) i1 = i; if (j < j0) j0 = j; if (j > j1) j1 = j;
     }
   }
-  if (i1 < 0) { AX.fill(0); AY.fill(0); AP.fill(0); return; }   // still air everywhere: nothing to do
+  if (i1 < 0) { AX.fill(0); AY.fill(0); AP.fill(0); if (pxLive || presActive) { PR.fill(0); PXv.fill(0); PYv.fill(0); PGX.fill(0); PGY.fill(0); PDV.fill(0); } presActive = false; pxLive = false; airMax2 = 0; pvMax2 = 0; return; }   // still air everywhere: nothing to do
   const PAD = 10;
   i0 = Math.max(0, i0 - PAD); i1 = Math.min(GX - 1, i1 + PAD); j0 = Math.max(0, j0 - PAD); j1 = Math.min(GY - 1, j1 + PAD);
   // outside the working box the air is at rest
   for (let j = 0; j < GY; j++) for (let i = 0; i < GX; i++) {
     if (i >= i0 && i <= i1 && j >= j0 && j <= j1) continue;
-    const c = j * GX + i; AX[c] = 0; AY[c] = 0; AP[c] = 0;
+    const c = j * GX + i; AX[c] = 0; AY[c] = 0; AP[c] = 0; PR[c] = 0; PXv[c] = 0; PYv[c] = 0; PGX[c] = 0; PGY[c] = 0; PDV[c] = 0;
   }
   // forces: hot air rises, smoke is a little heavy, vorticity confinement keeps the swirls alive
   for (let j = Math.max(1, j0); j <= Math.min(GY - 2, j1); j++) for (let i = Math.max(1, i0); i <= Math.min(GX - 2, i1); i++) {
@@ -878,6 +1141,8 @@ function airVelocity() {
     const s2 = AX[c] * AX[c] + AY[c] * AY[c];
     if (s2 > A_VMAX * A_VMAX) { const f = A_VMAX / Math.sqrt(s2); AX[c] *= f; AY[c] *= f; }
   }
+  if (pAny || presActive || pxLive) pressureStep(i0, i1, j0, j1);
+  else { airMax2 = 0; pvMax2 = 0; }
 }
 const advIn = [gS, gV, gM, gF, gK, gH, temp], ADV_T = 6;
 const advTmp = advIn.map(() => new Float32Array(N));
@@ -983,8 +1248,16 @@ function gasChemistry() {
 }
 function airStep() {
   airVelocity();
+  const pf = pxOn && pvMax2 > 4e-4;
+  if (pf) for (let c = 0; c < GN; c++) { AX[c] -= PXv[c]; AY[c] -= PYv[c]; }       // the wind carries the gas first,
   advectGases();
+  if (pf) {
+    for (let c = 0; c < GN; c++) { AX[c] += PXv[c]; AY[c] += PYv[c]; }
+    if (!gasIdle) pressureTransport();                                              // then the pressure flow moves it, conserving it
+  }
   gasChemistry();
+  if ((frame & 1) === 0) { hydroStep(); airLift(); }
+  if (frame % 3 === 1 && (presActive || hsActive)) pressureBreak();
 }
 function addHeatFlame(i, T, flame, smoke) {
   if (!isAir(i)) return;
@@ -1079,6 +1352,7 @@ function explode(x, y, bonus) {
   }
   // the blast throws whole pieces: moving bodies get an impulse now, resting ones are woken up with one
   blastQ.push(x, y, power, R);
+  pressureBurst(x, y, R, power);                       // the blast is also a pressure wave: it shoves and cracks things beyond its fireball
   for (const rb of RBS) {
     const bx = (rb.comX ?? rb.x) - x, by = (rb.comY ?? rb.y) - y, d = Math.hypot(bx, by) || 1, reach = R * 4;
     if (d > reach) continue;
@@ -1747,9 +2021,11 @@ function rbStep(rb) {
   let [comX, comY] = toWorld(rb, cx, cy, rb.x, rb.y, rb.a);
   // liquid pressure on wet faces (buoyancy, being pushed by a current), measured while our cells are still in the grid
   liquidForce(rb.raster, rb.raster.length, j => rbOwner[j] === rb.id, comX, comY);
+  airForce(rb.raster, 0, rb.raster.length, j => rbOwner[j] === rb.id, comX, comY, rb.vx, rb.vy);
   rbClear(rb);
   rb.vy += RB_G;
   rb.vx += LF.fx / M; rb.vy += LF.fy / M; rb.w += LF.tau / I;
+  rb.vx += AF.fx / M; rb.vy += AF.fy / M; rb.w += AF.tau / I;   // air pressure and wind: the push grows with the exposed surface and shrinks with the mass
   if (LF.wet) {
     // water drag: the deeper a body sits, the harder the water resists it (a floating plank settles instead of bobbing)
     const f = Math.min(1, LF.sub / Math.max(1, LF.n));
@@ -2258,6 +2534,7 @@ function solidBodies() {
       if (req) { wakeBody(s0, n, 0, 0); continue; }
     }
     if (!anchored && !grounded && blastQ.length && blastKick(s0, n)) continue;
+    if (!anchored && !grounded && stressTick && airKick(s0, n, M)) continue;
     if (anchored || grounded) { if (stressTick && n > 3) stressBody(s0, n, b + 1); continue; }
     const comX = mx / M, comY = my / M, lbl = b + 1;
     // 1) nothing underneath anywhere -> falls
@@ -2349,7 +2626,7 @@ const pix = new Uint32Array(img.data.buffer);
 const fW = new Float32Array(N), fR = new Float32Array(N), fG = new Float32Array(N), fBl = new Float32Array(N);
 const fE = new Float32Array(N), fS = new Float32Array(N), fTmp = new Float32Array(N);
 const dA = new Float32Array(N), dB = new Float32Array(N);
-let heatView = false, lightOn = true, renderMs = 0, rc = 0;
+let presView = false, heatView = false, lightOn = true, renderMs = 0, rc = 0;
 let lightEff = true;              // what the renderer actually uses: the light toggle, unless the frame governor has dropped lighting to keep the device responsive
 const clamp = v => v < 0 ? 0 : v > 255 ? 255 : v | 0;
 const pack = (r, g, b) => (255 << 24) | (clamp(b) << 16) | (clamp(g) << 8) | clamp(r);
@@ -2784,7 +3061,7 @@ function render() {
   rc++;
   lightEff = lightOn && qLevel < 3;
   splatLiquids();
-  if (heatView) { renderHeat(); drawCursor(); ctx.putImageData(img, 0, 0); return; }
+  if (heatView) { renderHeat(); if (presView) overlayPressure(); drawCursor(); ctx.putImageData(img, 0, 0); return; }
   scanColumns();
   if (lightEff) { boxH(occ, fTmp, W, H, 2); boxV(fTmp, occB, W, H, 2); }
   trackBodies();
@@ -2793,6 +3070,7 @@ function render() {
   splatGrains();
   buildLight(emSum);
   compose();
+  if (presView) overlayPressure();
   drawCursor();
   ctx.putImageData(img, 0, 0);
   renderMs += (performance.now() - t0 - renderMs) * 0.1;
@@ -3098,8 +3376,8 @@ const DESC = {
   SHARDS: 'Broken glass', SAWDUST: 'Light, flammable', ASH: 'Fluffy remains of a fire', HEATER: 'Keeps itself at 700 °C', COOLER: 'Keeps itself at −120 °C',
   HEAT: 'Warms whatever is under the brush. Hold Shift for a blowtorch', COOL: 'Chills whatever is under the brush. Hold Shift for liquid-nitrogen cold',
   WIND: 'Drag to blow air in that direction. Hold Shift for a gale',
-  AIR: 'Pumps pressure into the air: blasts smoke, gas, grains and liquid outward. Hold Shift for a burst',
-  VACUUM: 'Sucks air, gas and loose material toward the brush. Hold Shift for a hard pull',
+  AIR: 'Pumps up air pressure: it flows outward, shoving gas, liquid, loose grains and light objects, and can crack thin glass in a closed space. Hold Shift for a burst',
+  VACUUM: 'Lowers air pressure so everything flows toward it (gas piles up, nothing vanishes). Hold Shift for a hard pull',
   COAL: 'Burns slowly and very hot', CEMENT: 'Sets into concrete when it gets wet', THERMITE: 'Burns at 2500 °C and melts through metal; needs a hot start',
   SEED: 'Sprouts into a plant on damp soil', CLAY: 'Sticky; fires into brick in strong heat', CONCRETE: 'Strong and heavy', BRICK: 'Strong, fire-proof',
   RUBBER: 'Bouncy, unbreakable, burns with thick smoke', COPPER: 'Conducts heat best, turns green in water', TNT: 'Blows up when heated',
@@ -3164,6 +3442,7 @@ function setPausedUI() {
   $('pausedTag').style.display = paused ? 'block' : 'none';
 }
 function stepOnce() { if (netCmd('step')) return; if (!paused) togglePause(); step(); }
+function togglePres() { if (netCmd('pres')) return; presView = !presView; $('bPres').classList.toggle('on', presView); $('mPres').classList.toggle('on', presView); }
 function toggleHeat() { if (netCmd('heat')) return; heatView = !heatView; $('bHeat').classList.toggle('on', heatView); $('mHeat').classList.toggle('on', heatView); }
 function toggleLight() { if (netCmd('light')) return; lightOn = !lightOn; $('bLight').classList.toggle('on', lightOn); $('mLight').classList.toggle('on', lightOn); }
 $('bPause').innerHTML = ICON_PAUSE; $('mPause').innerHTML = ICON_PAUSE;
@@ -3171,6 +3450,7 @@ $('bPause').onclick = () => togglePause();
 $('bStep').onclick = () => stepOnce();
 $('bClear').onclick = () => clearAll();
 $('bHeat').onclick = () => toggleHeat();
+$('bPres').onclick = () => togglePres();
 $('bLight').onclick = () => toggleLight();
 function toggleOrient() {
   if (NET.role === 'guest') return;
@@ -3202,6 +3482,7 @@ function applyLayout() {
 }
 $('mPause').onclick = () => togglePause();
 $('mHeat').onclick = () => toggleHeat();
+$('mPres').onclick = () => togglePres();
 $('mLight').onclick = () => toggleLight();
 let sureTimer = 0;
 $('mClear').onclick = () => {                                      // wiping the scene by accident with a thumb is easy: ask twice
@@ -3235,7 +3516,7 @@ function clearAll() {
     return;
   }
   dmg.fill(0); soot.fill(0); grp.fill(0); held.fill(0); ng = 0; RBS.length = 0; rbOwner.fill(0); type.fill(0); temp.fill(AMBIENT); life.fill(0); vel.fill(0); hv.fill(0); lOcc.fill(0); lKind.fill(-1); np = 0;
-  gS.fill(0); gV.fill(0); gM.fill(0); gF.fill(0); gC.fill(0); gK.fill(0); gH.fill(0); AX.fill(0); AY.fill(0); AP.fill(0); }
+  gS.fill(0); gV.fill(0); gM.fill(0); gF.fill(0); gC.fill(0); gK.fill(0); gH.fill(0); AX.fill(0); AY.fill(0); AP.fill(0); PR.fill(0); PXv.fill(0); PYv.fill(0); PGX.fill(0); PGY.fill(0); PDV.fill(0); HS.fill(0); pxOn = false; presActive = false; hsActive = false; }
 
 function cellAt(e) {
   const r = cv.getBoundingClientRect();
@@ -3258,41 +3539,22 @@ function toolPaint(x, y) {
     return;
   }
   if (sel === ID.AIR || sel === ID.VACUUM) {
-    // pressure: an air source (or sink) in the middle of the brush. The air solver turns it into a real outward (inward) flow that
-    // carries smoke and gas; liquid and loose grains also get a direct radial shove, and the vacuum swallows gas near its centre
+    // a pressure source (Air) or sink (Vacuum): it only edits the pressure field. The air solver turns the pressure difference into
+    // flow, and gas, liquid, grains, bodies and thin walls all react to that pressure. Nothing is pulled, pushed or deleted by hand.
     const out = sel === ID.AIR, g = (shiftDown ? 3 : 1) * (out ? 1 : -1), gr = Math.ceil(r / GS) + 1;
     const gx0 = (x / GS) | 0, gy0 = (y / GS) | 0;
     for (let j = gy0 - gr; j <= gy0 + gr; j++) for (let i = gx0 - gr; i <= gx0 + gr; i++) {
       if (i < 0 || j < 0 || i >= GX || j >= GY) continue;
       const dd = ((i - gx0) ** 2 + (j - gy0) ** 2) / (gr * gr), c = j * GX + i;
       if (dd > 1 || ASol[c]) continue;
-      AEx[c] += g * 0.5 * (1 - dd);
+      PR[c] = Math.max(-P_MAX, Math.min(P_MAX, PR[c] + g * 0.9 * (1 - dd)));
     }
-    const reach = r * 2.5 + 12, rr2 = reach * reach;
+    // liquid fills its air cells, so it has no pressure cell of its own: it feels the same pressure bump directly (heavy liquids move less)
+    const reach = gr * GS + 3, rr2 = reach * reach;
     for (let k = 0; k < np; k++) {
       const dx = px[k] - x - 0.5, dy = py[k] - y - 0.5, d2 = dx * dx + dy * dy; if (d2 > rr2) continue;
-      const d = Math.sqrt(d2) + 1, f = (1 - d / reach) * 0.5 * g / d;
+      const d = Math.sqrt(d2) + 0.5, f = (1 - d / reach) * 2 * g / (d * LQ_RHO[pk[k]]);
       pvx[k] += dx * f; pvy[k] += dy * f;
-    }
-    for (let k = 0; k < ng; k++) {
-      const dx = gpx[k] - x - 0.5, dy = gpy[k] - y - 0.5, d2 = dx * dx + dy * dy; if (d2 > rr2) continue;
-      const d = Math.sqrt(d2) + 1, f = (1 - d / reach) * 0.7 * g / d;
-      gvx[k] += dx * f; gvy[k] += dy * f;
-    }
-    if (out) {                                          // expanding air thins the gas it pushes (otherwise a diverging flow would make smoke out of nothing)
-      const cr = reach | 0, cr2 = cr * cr;
-      for (let dy = -cr; dy <= cr; dy++) for (let dx = -cr; dx <= cr; dx++) {
-        if (dx * dx + dy * dy > cr2 || !inb(x + dx, y + dy)) continue;
-        const i = (y + dy) * W + x + dx, k = 1 - 0.05 * (1 - Math.sqrt(dx * dx + dy * dy) / cr);
-        gS[i] *= k; gV[i] *= k; gM[i] *= k; gF[i] *= k; gK[i] *= k; gH[i] *= k;
-      }
-    } else {                                            // the vacuum removes gas, smoke and flame that reach its core
-      const cr = r + 1, cr2 = cr * cr;
-      for (let dy = -cr; dy <= cr; dy++) for (let dx = -cr; dx <= cr; dx++) {
-        if (dx * dx + dy * dy > cr2 || !inb(x + dx, y + dy)) continue;
-        const i = (y + dy) * W + x + dx, k = shiftDown ? 0.5 : 0.8;
-        gS[i] *= k; gV[i] *= k; gM[i] *= k; gF[i] *= k; gK[i] *= k; gH[i] *= k;
-      }
     }
     return;
   }
@@ -3310,7 +3572,7 @@ function toolPaint(x, y) {
     }
     // it also ruffles liquid surfaces and shoves grains in flight
     const lr2 = (r + 2) * (r + 2);
-    for (let k = 0; k < np; k++) { const dx = px[k] - x, dy = py[k] - y; if (dx * dx + dy * dy <= lr2) { pvx[k] += vx * 0.04; pvy[k] += vy * 0.04; } }
+    for (let k = 0; k < np; k++) { const dx = px[k] - x, dy = py[k] - y; if (dx * dx + dy * dy <= lr2) { pvx[k] += vx * 0.04 / LQ_RHO[pk[k]]; pvy[k] += vy * 0.04 / LQ_RHO[pk[k]]; } }
     for (let k = 0; k < ng; k++) { const dx = gpx[k] - x, dy = gpy[k] - y; if (dx * dx + dy * dy <= lr2) { gvx[k] += vx * 0.08; gvy[k] += vy * 0.08; } }
   }
 }
@@ -3386,6 +3648,7 @@ window.addEventListener('keydown', e => {
   if (e.code === 'Space') { e.preventDefault(); togglePause(); }
   else if (k === 'c' || k === 'C') clearAll();
   else if (k === 't' || k === 'T') toggleHeat();
+  else if (k === 'v' || k === 'V') togglePres();
   else if (k === 'l' || k === 'L') toggleLight();
   else if (k === 'p' || k === 'P') toggleOrient();
   else if (k === 'x' || k === 'X') toggleErase();
@@ -3567,7 +3830,7 @@ function hostData(a, m) {
     return;
   }
   if (t === 'c') {
-    ({ pause: togglePause, step: stepOnce, clear: clearAll, heat: toggleHeat, light: toggleLight })[m.c]?.();
+    ({ pause: togglePause, step: stepOnce, clear: clearAll, heat: toggleHeat, pres: togglePres, light: toggleLight })[m.c]?.();
     NET.lastSt = 0; return;
   }
   if (t !== 'd' && t !== 'm' && t !== 'u') return;
@@ -3599,7 +3862,7 @@ function netHostFrame(now) {
   if (NET.mctx) NET.mctx.putImageData(img, 0, 0);
   if (now - NET.lastSt > 500) {
     NET.lastSt = now;
-    const st = { t: 'st', p: paused ? 1 : 0, h: heatView ? 1 : 0, l: lightOn ? 1 : 0, f: NET.fps, q: qLevel };
+    const st = { t: 'st', p: paused ? 1 : 0, h: heatView ? 1 : 0, v: presView ? 1 : 0, l: lightOn ? 1 : 0, f: NET.fps, q: qLevel };
     for (const a of NET.actors) { try { if (a.conn.open) a.conn.send(st); } catch (e) {} }
   }
 }
@@ -3641,6 +3904,7 @@ function guestData(m) {
   } else if (m.t === 'st') {
     if (!!m.p !== paused) { paused = !!m.p; setPausedUI(); }
     if (!!m.h !== heatView) { heatView = !!m.h; $('bHeat').classList.toggle('on', heatView); $('mHeat').classList.toggle('on', heatView); }
+    if (!!m.v !== presView) { presView = !!m.v; $('bPres').classList.toggle('on', presView); $('mPres').classList.toggle('on', presView); }
     if (!!m.l !== lightOn) { lightOn = !!m.l; $('bLight').classList.toggle('on', lightOn); $('mLight').classList.toggle('on', lightOn); }
     if (m.f !== undefined) { $('iF').textContent = m.f; $('mF').textContent = m.f; }
     if (m.q !== undefined) $('mQ').textContent = Q_NAMES[m.q] || '';
@@ -3734,7 +3998,7 @@ function frameBody(now) {
   if ((rc & 7) === 0 && mx >= 0 && inb(mx, my)) {
     const i = my * W + mx;
     let nm = 'Air';
-    if (type[i]) nm = DEFS[type[i]].n + (life[i] > 0 && IGN[type[i]] < 1e9 ? ' (burning)' : '');
+    if (type[i]) nm = DEFS[type[i]].n + (KIND[type[i]] === 1 ? ' · ρ ' + RHO[type[i]] : '') + (life[i] > 0 && IGN[type[i]] < 1e9 ? ' (burning)' : '');
     else if (lOcc[i] && lKind[i] >= 0) nm = DEFS[LQ[lKind[i]]].n;   // (lKind is -1 for a pixel just painted this frame; indexing with it threw and killed the whole frame loop)
     else if (gF[i] > 0.1) nm = 'Flame';
     else if (gS[i] > 0.05) nm = 'Smoke';
@@ -3743,7 +4007,8 @@ function frameBody(now) {
     else if (gH[i] > 0.05) nm = 'Hydrogen';
     else if (gK[i] > 0.05) nm = 'CO2';
     $('iEl').textContent = nm;
-    $('iT').textContent = temp[i].toFixed(0) + ' °C';
+    const pv = (type[i] ? 0 : (HS[i] > 0 ? HS[i] : PR[CI[i]])) * 10;
+    $('iT').textContent = temp[i].toFixed(0) + ' °C' + (pv > 0.5 || pv < -0.5 ? ' · ' + pv.toFixed(0) + ' kPa' : '');
   }
   if ((frame & 15) === 0) {
     let c = 0; for (let i = 0; i < N; i++) if (type[i]) c++;
