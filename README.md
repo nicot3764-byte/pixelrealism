@@ -16,7 +16,10 @@ Development checks (Node.js with Playwright):
 npm install --no-save playwright
 npx playwright install chromium
 node tests/browser.cjs
+node tests/destruction.cjs
 node tests/benchmark.cjs
 ```
 
 Use `CHROMIUM_PATH=/path/to/chromium` with an existing browser. Set `BASELINE_HTML=/path/to/previous/index.html` to compare exact heat diffusion and six rendered scenes against the previous version, verify that menu HTML/CSS are unchanged, and benchmark both versions. Benchmarks report CPU milliseconds per tick plus render at full quality; actual FPS depends on the device, scene and canvas size.
+
+Destruction regression checks cover repeated shattering, compact shard masks, rotated world-space placement and pixel coverage, and mass/inertia invalidation after erasing, changing material or chipping a moving body. Shards allocate only their occupied bounding rectangle; unchanged body masks reuse mass properties.
