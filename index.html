@@ -2111,6 +2111,7 @@ function rbShove(rb, nx, ny, na, M) {
   return hit.size > 0;
 }
 function rbMass(rb) {
+  if (rb.mass) return rb.mass;
   let M = 0, mx = 0, my = 0;
   for (let j = 0; j < rb.mh; j++) for (let i = 0; i < rb.mw; i++) {
     const t = rb.mt[j * rb.mw + i]; if (!t) continue;
@@ -2123,7 +2124,7 @@ function rbMass(rb) {
     const t = rb.mt[j * rb.mw + i]; if (!t) continue;
     I += RHO[t] * ((i + 0.5 - cx) ** 2 + (j + 0.5 - cy) ** 2 + 0.17);
   }
-  return { M, cx, cy, I };
+  return rb.mass = { M, cx, cy, I };
 }
 function toWorld(rb, lx, ly, x, y, a) { const c = Math.cos(a), s = Math.sin(a); return [x + c * lx - s * ly, y + s * lx + c * ly]; }
 function wakeBody(s0, n, vx, vy) {
@@ -2145,8 +2146,8 @@ function rbSync(rb) {
     const c = rb.raster[m], k = rb.rk[m];
     if (rbOwner[c] !== rb.id) continue;
     const t = type[c];
-    if (KIND[t] === 1) { rb.mt[k] = t; rb.mtm[k] = temp[c]; rb.mlf[k] = life[c]; rb.mhv[k] = hv[c]; rb.mnz[k] = nz[c]; rb.mdm[k] = dmg[c]; }
-    else { rb.mt[k] = 0; rbOwner[c] = 0; }
+    if (KIND[t] === 1) { if (rb.mt[k] !== t) rb.mass = null; rb.mt[k] = t; rb.mtm[k] = temp[c]; rb.mlf[k] = life[c]; rb.mhv[k] = hv[c]; rb.mnz[k] = nz[c]; rb.mdm[k] = dmg[c]; }
+    else { if (rb.mt[k]) rb.mass = null; rb.mt[k] = 0; rbOwner[c] = 0; }
   }
 }
 function rbClear(rb) {
@@ -2163,7 +2164,7 @@ function rbRaster(rb, own) {
     if (type[c] !== 0) return;
     if (rb.crack[k]) {                                // broken off on impact: falls away as debris
       const d = DEBRIS[rb.mt[k]];
-      rb.mt[k] = 0; rb.crack[k] = 0;
+      rb.mt[k] = 0; rb.mass = null; rb.crack[k] = 0;
       if (d) { type[c] = d; temp[c] = rb.mtm[k]; nz[c] = rb.mnz[k]; life[c] = 0; hv[c] = 0; vel[c] = 0; moved[c] = 1; }
       return;
     }
@@ -2338,22 +2339,27 @@ function rbBreak(rb, wx, wy, speed, t0) {
     }
   }
   if (!cut) return false;
-  // split into connected pieces (cells bond only within one group, crumbs are gone)
-  const sz = rb.mt.length, lab = new Int32Array(sz).fill(-1), st = [];
-  let np2 = 0;
+  // Label each connected piece once and record its occupied bounds. A shard must
+  // not inherit the entire parent's mostly empty mask: repeated breaks used to
+  // multiply allocation, collision, mass and texture work by the original slab area.
+  const sz = rb.mt.length, lab = new Int32Array(sz).fill(-1), st = [], pieces = [];
   for (let k0 = 0; k0 < sz; k0++) {
     if (!rb.mt[k0] || rb.crack[k0] || lab[k0] >= 0) continue;
-    lab[k0] = np2; st.push(k0);
+    const pc = pieces.length, piece = { cells: [], x0: rb.mw, y0: rb.mh, x1: -1, y1: -1, sx: 0, sy: 0 };
+    lab[k0] = pc; st.push(k0);
     while (st.length) {
       const k = st.pop(), i = k % rb.mw, j = (k / rb.mw) | 0;
-      for (const [ii, jj] of [[i - 1, j], [i + 1, j], [i, j - 1], [i, j + 1]]) {
-        if (ii < 0 || jj < 0 || ii >= rb.mw || jj >= rb.mh) continue;
-        const q = jj * rb.mw + ii;
-        if (lab[q] >= 0 || !rb.mt[q] || rb.crack[q] || rb.mgr[q] !== rb.mgr[k]) continue;
-        lab[q] = np2; st.push(q);
+      piece.cells.push(k); piece.sx += i + 0.5; piece.sy += j + 0.5;
+      if (i < piece.x0) piece.x0 = i; if (i > piece.x1) piece.x1 = i;
+      if (j < piece.y0) piece.y0 = j; if (j > piece.y1) piece.y1 = j;
+      // Same four-neighbour bond rule; avoid allocating four coordinate pairs per cell.
+      for (let d = 0; d < 4; d++) {
+        const q = d === 0 ? (i > 0 ? k - 1 : -1) : d === 1 ? (i + 1 < rb.mw ? k + 1 : -1) : d === 2 ? k - rb.mw : k + rb.mw;
+        if (q < 0 || q >= sz || lab[q] >= 0 || !rb.mt[q] || rb.crack[q] || rb.mgr[q] !== rb.mgr[k]) continue;
+        lab[q] = pc; st.push(q);
       }
     }
-    np2++;
+    pieces.push(piece);
   }
   // crumbs go into the world as debris first
   rbVisit(rb, rb.x, rb.y, rb.a, (px, py, k) => {
@@ -2362,14 +2368,17 @@ function rbBreak(rb, wx, wy, speed, t0) {
     if (type[c] === 0 && DEBRIS[rb.mt[k]]) { type[c] = DEBRIS[rb.mt[k]]; temp[c] = rb.mtm[k]; nz[c] = rb.mnz[k]; vel[c] = 0; hv[c] = 0; toGrain(c, rb.vx + (Math.random() - 0.5) * 1.2, rb.vy - Math.random() * 1.2); }
   });
   const [ccx, ccy] = toWorld(rb, rb.mw / 2, rb.mh / 2, rb.x, rb.y, rb.a);
-  for (let pc = 0; pc < np2; pc++) {
-    const nb = { id: rbNext++, x: rb.x, y: rb.y, a: rb.a, vx: rb.vx, vy: rb.vy, w: rb.w, mw: rb.mw, mh: rb.mh, rest: 0,
-      mt: new Uint8Array(sz), mtm: new Float32Array(sz), mlf: new Int16Array(sz), mnz: new Int8Array(sz), mhv: new Int8Array(sz), mgr: new Uint16Array(sz), mdm: new Uint8Array(sz), crack: new Uint8Array(sz), raster: [], rk: [] };
-    let sx = 0, sy = 0, cn = 0;
-    for (let k = 0; k < sz; k++) if (lab[k] === pc) {
-      nb.mt[k] = rb.mt[k]; nb.mtm[k] = rb.mtm[k]; nb.mlf[k] = rb.mlf[k]; nb.mnz[k] = rb.mnz[k]; nb.mhv[k] = rb.mhv[k]; nb.mgr[k] = rb.mgr[k]; nb.mdm[k] = rb.mdm[k];
-      sx += k % rb.mw + 0.5; sy += ((k / rb.mw) | 0) + 0.5; cn++;
+  for (const piece of pieces) {
+    const { x0, y0, x1, y1, cells } = piece, mw = x1 - x0 + 1, mh = y1 - y0 + 1, area = mw * mh;
+    // Moving the local origin requires rotating the crop offset into world space.
+    const [x, y] = toWorld(rb, x0, y0, rb.x, rb.y, rb.a);
+    const nb = { id: rbNext++, x, y, a: rb.a, vx: rb.vx, vy: rb.vy, w: rb.w, mw, mh, rest: 0,
+      mt: new Uint8Array(area), mtm: new Float32Array(area), mlf: new Int16Array(area), mnz: new Int8Array(area), mhv: new Int8Array(area), mgr: new Uint16Array(area), mdm: new Uint8Array(area), crack: new Uint8Array(area), raster: [], rk: [] };
+    for (const k of cells) {
+      const q = (((k / rb.mw) | 0) - y0) * mw + k % rb.mw - x0;
+      nb.mt[q] = rb.mt[k]; nb.mtm[q] = rb.mtm[k]; nb.mlf[q] = rb.mlf[k]; nb.mnz[q] = rb.mnz[k]; nb.mhv[q] = rb.mhv[k]; nb.mgr[q] = rb.mgr[k]; nb.mdm[q] = rb.mdm[k];
     }
+    const sx = piece.sx, sy = piece.sy, cn = cells.length;
     // pieces spring apart a little, away from the middle of the old body
     const [pxw, pyw] = toWorld(rb, sx / cn, sy / cn, rb.x, rb.y, rb.a);
     const dx = pxw - ccx, dy = pyw - ccy, dl = Math.hypot(dx, dy) || 1, kick = Math.min(0.6, (speed - RB_BREAK[t0]) * 0.15 + 0.1);
