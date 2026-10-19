@@ -263,7 +263,25 @@ try {
   const oq = /[?&]o=([pl])/.exec(location.search);          // an invite link carries the host's canvas shape (?join=CODE&o=p|l) so both sides match
   if (oq && /[?&]join=/.test(location.search)) PORTRAIT = oq[1] === 'p';
 } catch (e) {}
-const W = PORTRAIT ? 480 : 800, H = PORTRAIT ? 800 : 480, N = W * H;
+// The solver uses 2x2 cells. Validate before allocating any simulation buffers.
+const CANVAS_MAX_SIDE = 2048, CANVAS_MAX_PIXELS = 1048576;
+function canvasSize(w, h) {
+  return Number.isInteger(w) && Number.isInteger(h) && w >= 32 && h >= 32 &&
+    w <= CANVAS_MAX_SIDE && h <= CANVAS_MAX_SIDE && !(w & 1) && !(h & 1) &&
+    w * h <= CANVAS_MAX_PIXELS ? [w, h] : null;
+}
+let customSize = null;
+try {
+  const query = new URLSearchParams(location.search);
+  if (query.has('join')) customSize = canvasSize(Number(query.get('w')), Number(query.get('h')));
+  else {
+    const saved = JSON.parse(localStorage.getItem('pr-canvas') || 'null');
+    if (Array.isArray(saved)) customSize = canvasSize(saved[0], saved[1]);
+  }
+} catch (e) {}
+if (customSize) PORTRAIT = customSize[1] > customSize[0];
+const W = customSize ? customSize[0] : PORTRAIT ? 480 : 800;
+const H = customSize ? customSize[1] : PORTRAIT ? 800 : 480, N = W * H;
 const AMBIENT = 22;
 
 // kinds: 0 empty, 1 solid, 2 powder, 3 liquid, 4 gas
@@ -385,11 +403,20 @@ const LQ_DAMP = [1.0, 0.995, 1.0, 0.94, 0.9, 1.0, 1.0];
 const LQ_COND = [0.22, 0.08, 0.15, 0.3, 0.1, 0.5, 0.1];
 const pRho = k => { const f = 1 - 0.0004 * (pt[k] - 20); return LQ_RHO[pk[k]] * (f > 0.25 ? f : 0.25); };   // thermal expansion: warm liquid is lighter and rises (floored so a white-hot liquid can never reach zero or negative density)
 
-const MAXP = 60000;
-const px = new Float32Array(MAXP), py = new Float32Array(MAXP);
-const pvx = new Float32Array(MAXP), pvy = new Float32Array(MAXP);
-const pk = new Uint8Array(MAXP), pt = new Float32Array(MAXP);
+// Grow with the scene; capacity is allocated storage, never a particle limit.
+let particleCapacity = 16384;
+let px = new Float32Array(particleCapacity), py = new Float32Array(particleCapacity);
+let pvx = new Float32Array(particleCapacity), pvy = new Float32Array(particleCapacity);
+let pk = new Uint8Array(particleCapacity), pt = new Float32Array(particleCapacity);
 let np = 0;
+function growLiquids() {
+  const capacity = particleCapacity * 2;
+  const grow = a => { const b = new a.constructor(capacity); b.set(a); return b; };
+  // Allocate first so a failed allocation cannot leave buffers with different sizes.
+  const arrays = [px, py, pvx, pvy, pk, pt, HI].map(grow);
+  [px, py, pvx, pvy, pk, pt, HI] = arrays;
+  particleCapacity = capacity;
+}
 
 const GS = 2, GX = W / GS, GY = H / GS, GN = GX * GY;          // pressure grid: 2x2 pixels per cell
 const U = new Float32Array((GX + 1) * GY), UW = new Float32Array((GX + 1) * GY), UO = new Float32Array((GX + 1) * GY);
@@ -406,20 +433,14 @@ let qLevel = 0;
 const Q_ITERS = [L_ITERS, 40, 28, 18], Q_NAMES = ['full', 'balanced', 'light', 'minimal'];
 function setQuality(q) { qLevel = q; lqIters = Q_ITERS[q]; }
 const IS_TOUCH = (() => { try { return matchMedia('(pointer:coarse)').matches || /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent); } catch (e) { return false; } })();
-const PCAP = IS_TOUCH ? 10000 : 36000;                          // most liquid particles a pour may reach (MAXP is the hard array limit)
-let capToastAt = 0;
-function noteCap() {                                            // tell the person why the pour stopped growing, at most every few seconds
-  const t = performance.now();
-  if (t - capToastAt > 4000) { capToastAt = t; showToast('liquid limit', 'reached for this device: clear some liquid to pour more'); }
-}
 let spawnBudget = 0;                                            // liquid particles the brush may still add this frame
 const QN = new Int32Array(GN * 4), QW = new Float32Array(GN * 4), QI = new Float32Array(GN);   // pressure stencil, rebuilt every solve
 const SB = new Uint8Array(N);                                    // 1 where a pixel is solid (rebuilt every frame by particlesToGrid)
-const CI = new Uint16Array(N);                                   // pixel -> index of its 2x2 coarse cell (lookup instead of a division per pixel)
+const CI = new Uint32Array(N);                                   // 800x480 already exceeds 65535 coarse cells: never truncate cell indices
 for (let i = 0; i < N; i++) CI[i] = (((i / W) | 0) >> 1) * GX + (((i % W)) >> 1);
 
 // per-pixel liquid info, rebuilt every frame
-const lOcc = new Uint8Array(N);       // particles in this pixel
+const lOcc = new Uint32Array(N);       // particles in this pixel (no 255-particle temperature/count overflow)
 const lKind = new Int8Array(N);       // liquid index present (-1 none)
 const tSum = new Float32Array(N);
 const consumeReq = new Uint8Array(N);
@@ -431,7 +452,8 @@ function blocked(x, y) {
 }
 function addLiquid(e, x, y, T, vx, vy) {
   const li = LQI[e];
-  if (li < 0 || np >= MAXP) return;
+  if (li < 0) return;
+  if (np === particleCapacity) growLiquids();
   px[np] = x; py[np] = y; pvx[np] = vx || 0; pvy[np] = vy || 0; pk[np] = li;
   pt[np] = T === undefined ? DEFS[e].t0 : T; np++;
 }
@@ -465,71 +487,74 @@ function sampleV(arr, gx, gy) {
   return s;
 }
 function particlesToGrid() {
-  U.fill(0); UW.fill(0); V.fill(0); VW.fill(0); cCnt.fill(0); cRho.fill(0);
-  const GU = GX + 1;                                   // row stride of U
+  const W_ = W, N_ = N, GX_ = GX, GY_ = GY, GN_ = GN, GS_ = GS;
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const px_ = px, py_ = py, pvx_ = pvx, pvy_ = pvy, U_ = U, UW_ = UW, V_ = V, VW_ = VW, cCnt_ = cCnt, cRho_ = cRho, type_ = type, SB_ = SB, cTyp_ = cTyp, uC_ = uC, vC_ = vC, UO_ = UO, VO_ = VO;
+  U_.fill(0); UW_.fill(0); V_.fill(0); VW_.fill(0); cCnt_.fill(0); cRho_.fill(0);
+  const GU = GX_ + 1;                                   // row stride of U_
   for (let k = 0; k < np; k++) {
-    const gx = px[k] / GS, gy = py[k] / GS;
+    const gx = px_[k] / GS_, gy = py_[k] / GS_;
     let fx = gx, fy = gy - 0.5, i0 = Math.floor(fx), j0 = Math.floor(fy), ax = fx - i0, ay = fy - j0;
-    if (i0 >= 0 && i0 < GX && j0 >= 0 && j0 < GY - 1) {          // all four taps inside the grid: no per-tap checks
-      const id = j0 * GU + i0, v = pvx[k], w00 = (1 - ax) * (1 - ay), w10 = ax * (1 - ay), w01 = (1 - ax) * ay, w11 = ax * ay;
-      U[id] += w00 * v; UW[id] += w00; U[id + 1] += w10 * v; UW[id + 1] += w10;
-      U[id + GU] += w01 * v; UW[id + GU] += w01; U[id + GU + 1] += w11 * v; UW[id + GU + 1] += w11;
+    if (i0 >= 0 && i0 < GX_ && j0 >= 0 && j0 < GY_ - 1) {          // all four taps inside the grid: no per-tap checks
+      const id = j0 * GU + i0, v = pvx_[k], w00 = (1 - ax) * (1 - ay), w10 = ax * (1 - ay), w01 = (1 - ax) * ay, w11 = ax * ay;
+      U_[id] += w00 * v; UW_[id] += w00; U_[id + 1] += w10 * v; UW_[id + 1] += w10;
+      U_[id + GU] += w01 * v; UW_[id + GU] += w01; U_[id + GU + 1] += w11 * v; UW_[id + GU + 1] += w11;
     } else {
       for (let q = 0; q < 4; q++) {
         const i = i0 + (q & 1), j = j0 + (q >> 1);
-        if (i < 0 || i > GX || j < 0 || j >= GY) continue;
+        if (i < 0 || i > GX_ || j < 0 || j >= GY_) continue;
         const w = ((q & 1) ? ax : 1 - ax) * ((q >> 1) ? ay : 1 - ay), id = ui(i, j);
-        U[id] += w * pvx[k]; UW[id] += w;
+        U_[id] += w * pvx_[k]; UW_[id] += w;
       }
     }
     fx = gx - 0.5; fy = gy; i0 = Math.floor(fx); j0 = Math.floor(fy); const bx = fx - i0, by = fy - j0;
-    if (i0 >= 0 && i0 < GX - 1 && j0 >= 0 && j0 < GY) {
-      const id = j0 * GX + i0, v = pvy[k], w00 = (1 - bx) * (1 - by), w10 = bx * (1 - by), w01 = (1 - bx) * by, w11 = bx * by;
-      V[id] += w00 * v; VW[id] += w00; V[id + 1] += w10 * v; VW[id + 1] += w10;
-      V[id + GX] += w01 * v; VW[id + GX] += w01; V[id + GX + 1] += w11 * v; VW[id + GX + 1] += w11;
+    if (i0 >= 0 && i0 < GX_ - 1 && j0 >= 0 && j0 < GY_) {
+      const id = j0 * GX_ + i0, v = pvy_[k], w00 = (1 - bx) * (1 - by), w10 = bx * (1 - by), w01 = (1 - bx) * by, w11 = bx * by;
+      V_[id] += w00 * v; VW_[id] += w00; V_[id + 1] += w10 * v; VW_[id + 1] += w10;
+      V_[id + GX_] += w01 * v; VW_[id + GX_] += w01; V_[id + GX_ + 1] += w11 * v; VW_[id + GX_ + 1] += w11;
     } else {
       for (let q = 0; q < 4; q++) {
         const i = i0 + (q & 1), j = j0 + (q >> 1);
-        if (i < 0 || i >= GX || j < 0 || j > GY) continue;
+        if (i < 0 || i >= GX_ || j < 0 || j > GY_) continue;
         const w = ((q & 1) ? bx : 1 - bx) * ((q >> 1) ? by : 1 - by), id = vi(i, j);
-        V[id] += w * pvy[k]; VW[id] += w;
+        V_[id] += w * pvy_[k]; VW_[id] += w;
       }
     }
-    const ci = (gy | 0) * GX + (gx | 0);
-    if (ci >= 0 && ci < GN) { cCnt[ci]++; cRho[ci] += pRho(k); }
+    const ci = (gy | 0) * GX_ + (gx | 0);
+    if (ci >= 0 && ci < GN_) { cCnt_[ci]++; cRho_[ci] += pRho(k); }
   }
-  for (let i = 0; i < U.length; i++) U[i] = UW[i] > 0 ? U[i] / UW[i] : 0;
-  for (let i = 0; i < V.length; i++) V[i] = VW[i] > 0 ? V[i] / VW[i] : 0;
+  for (let i = 0; i < U_.length; i++) U_[i] = UW_[i] > 0 ? U_[i] / UW_[i] : 0;
+  for (let i = 0; i < V_.length; i++) V_[i] = VW_[i] > 0 ? V_[i] / VW_[i] : 0;
   // solid mask, one flat pass: the cell and face loops below read it directly instead of calling blocked() ~12 times per cell
-  for (let i = 0; i < N; i++) SB[i] = type[i] !== 0 ? 1 : 0;
-  for (let j = 0; j < GY; j++) {
-    const r0 = j * GS * W, r1 = r0 + W;
-    for (let i = 0; i < GX; i++) {
-      const c = j * GX + i, p = r0 + i * GS, p1 = r1 + i * GS;
-      const nb = SB[p] + SB[p + 1] + SB[p1] + SB[p1 + 1];
-      cTyp[c] = nb >= 3 ? 2 : cCnt[c] > 0 ? 1 : 0;
-      cRho[c] = cCnt[c] > 0 ? cRho[c] / cCnt[c] : 1;
+  for (let i = 0; i < N_; i++) SB_[i] = type_[i] !== 0 ? 1 : 0;
+  for (let j = 0; j < GY_; j++) {
+    const r0 = j * GS_ * W_, r1 = r0 + W_;
+    for (let i = 0; i < GX_; i++) {
+      const c = j * GX_ + i, p = r0 + i * GS_, p1 = r1 + i * GS_;
+      const nb = SB_[p] + SB_[p + 1] + SB_[p1] + SB_[p1 + 1];
+      cTyp_[c] = nb >= 3 ? 2 : cCnt_[c] > 0 ? 1 : 0;
+      cRho_[c] = cCnt_[c] > 0 ? cRho_[c] / cCnt_[c] : 1;
     }
   }
   // a face is closed when the pixels straddling it are walled off - so a 1-pixel wall seals exactly the face it sits on
-  for (let j = 0; j < GY; j++) {
-    const r0 = j * GS * W, r1 = r0 + W, row = j * GU, cr = j * GX;
-    uC[row] = 1; uC[row + GX] = 1;
-    for (let i = 1; i < GX; i++) {
-      const x = i * GS;
-      uC[row + i] = (cTyp[cr + i - 1] === 2 || cTyp[cr + i] === 2 || SB[r0 + x - 1] + SB[r0 + x] + SB[r1 + x - 1] + SB[r1 + x] >= 2) ? 1 : 0;
+  for (let j = 0; j < GY_; j++) {
+    const r0 = j * GS_ * W_, r1 = r0 + W_, row = j * GU, cr = j * GX_;
+    uC_[row] = 1; uC_[row + GX_] = 1;
+    for (let i = 1; i < GX_; i++) {
+      const x = i * GS_;
+      uC_[row + i] = (cTyp_[cr + i - 1] === 2 || cTyp_[cr + i] === 2 || SB_[r0 + x - 1] + SB_[r0 + x] + SB_[r1 + x - 1] + SB_[r1 + x] >= 2) ? 1 : 0;
     }
   }
-  for (let j = 0; j <= GY; j++) {
-    const row = j * GX;
-    if (j === 0 || j === GY) { for (let i = 0; i < GX; i++) vC[row + i] = 1; continue; }
-    const ra = (j * GS - 1) * W, rb = j * GS * W;
-    for (let i = 0; i < GX; i++) {
-      const x = i * GS;
-      vC[row + i] = (cTyp[row - GX + i] === 2 || cTyp[row + i] === 2 || SB[ra + x] + SB[ra + x + 1] + SB[rb + x] + SB[rb + x + 1] >= 2) ? 1 : 0;
+  for (let j = 0; j <= GY_; j++) {
+    const row = j * GX_;
+    if (j === 0 || j === GY_) { for (let i = 0; i < GX_; i++) vC_[row + i] = 1; continue; }
+    const ra = (j * GS_ - 1) * W_, rb = j * GS_ * W_;
+    for (let i = 0; i < GX_; i++) {
+      const x = i * GS_;
+      vC_[row + i] = (cTyp_[row - GX_ + i] === 2 || cTyp_[row + i] === 2 || SB_[ra + x] + SB_[ra + x + 1] + SB_[rb + x] + SB_[rb + x + 1] >= 2) ? 1 : 0;
     }
   }
-  UO.set(U); VO.set(V);
+  UO_.set(U_); VO_.set(V_);
 }
 function boundaryFaces() {
   for (let i = 0; i < U.length; i++) if (uC[i]) U[i] = 0;
@@ -540,77 +565,83 @@ function faceRho(a, b) {   // density at the face between grid cells a and b (ai
   return fa && fb ? 0.5 * (cRho[a] + cRho[b]) : fa ? cRho[a] : cRho[b];
 }
 function pressureSolve() {
-  for (let j = 0; j < GY; j++) for (let i = 0; i < GX; i++) {
-    const c = j * GX + i;
-    if (cTyp[c] !== 1) { Pr[c] = cTyp[c] === 0 ? PRS[c] * L_PSCALE_INV : 0; continue; }   // the air pressing on the surface (a pressurised tank squeezes its water out)
+  const GX_ = GX, GY_ = GY, GN_ = GN;
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const cTyp_ = cTyp, Pr_ = Pr, PRS_ = PRS, cCnt_ = cCnt, Dv_ = Dv, U_ = U, V_ = V, QW_ = QW, QN_ = QN, QI_ = QI, LQL_ = LQL, uC_ = uC, vC_ = vC;
+  for (let j = 0; j < GY_; j++) for (let i = 0; i < GX_; i++) {
+    const c = j * GX_ + i;
+    if (cTyp_[c] !== 1) { Pr_[c] = cTyp_[c] === 0 ? PRS_[c] * L_PSCALE_INV : 0; continue; }   // the air pressing on the surface (a pressurised tank squeezes its water out)
     // keep particle spacing even: over-packed cells push apart, thinned-out interior cells pull together
     // (cells touching air are allowed to be thin - that's the surface)
-    let dens = (cCnt[c] - L_REST) / L_REST;
-    if (dens < 0 && ((i > 0 && cTyp[c - 1] === 0) || (i < GX - 1 && cTyp[c + 1] === 0) || (j > 0 && cTyp[c - GX] === 0) || (j < GY - 1 && cTyp[c + GX] === 0))) dens = 0;
-    Dv[c] = U[ui(i + 1, j)] - U[ui(i, j)] + V[vi(i, j + 1)] - V[vi(i, j)] - L_DRIFT * dens;
+    let dens = (cCnt_[c] - L_REST) / L_REST;
+    if (dens < 0 && ((i > 0 && cTyp_[c - 1] === 0) || (i < GX_ - 1 && cTyp_[c + 1] === 0) || (j > 0 && cTyp_[c - GX_] === 0) || (j < GY_ - 1 && cTyp_[c + GX_] === 0))) dens = 0;
+    Dv_[c] = U_[ui(i + 1, j)] - U_[ui(i, j)] + V_[vi(i, j + 1)] - V_[vi(i, j)] - L_DRIFT * dens;
   }
   // Build the stencil once per solve (it does not change between iterations): neighbour index, face weight
   // 1/rho, and 1/sum(weights). Closed faces point back at the cell itself with weight 0, so no branches below.
   let nl = 0;
-  for (let c = 0; c < GN; c++) {
-    if (cTyp[c] !== 1) continue;
-    const j = (c / GX) | 0, i = c - j * GX, b = nl << 2;
+  for (let c = 0; c < GN_; c++) {
+    if (cTyp_[c] !== 1) continue;
+    const j = (c / GX_) | 0, i = c - j * GX_, b = nl << 2;
     let sw = 0;
-    if (!uC[ui(i, j)]) { const w = 1 / faceRho(c, c - 1); QW[b] = w; QN[b] = c - 1; sw += w; } else { QW[b] = 0; QN[b] = c; }
-    if (!uC[ui(i + 1, j)]) { const w = 1 / faceRho(c, c + 1); QW[b + 1] = w; QN[b + 1] = c + 1; sw += w; } else { QW[b + 1] = 0; QN[b + 1] = c; }
-    if (!vC[vi(i, j)]) { const w = 1 / faceRho(c, c - GX); QW[b + 2] = w; QN[b + 2] = c - GX; sw += w; } else { QW[b + 2] = 0; QN[b + 2] = c; }
-    if (!vC[vi(i, j + 1)]) { const w = 1 / faceRho(c, c + GX); QW[b + 3] = w; QN[b + 3] = c + GX; sw += w; } else { QW[b + 3] = 0; QN[b + 3] = c; }
-    if (!(sw > 0)) { Pr[c] = 0; continue; }       // sealed in on all sides (or a broken density): nothing to solve
-    QI[nl] = 1 / sw; LQL[nl++] = c;
+    if (!uC_[ui(i, j)]) { const w = 1 / faceRho(c, c - 1); QW_[b] = w; QN_[b] = c - 1; sw += w; } else { QW_[b] = 0; QN_[b] = c; }
+    if (!uC_[ui(i + 1, j)]) { const w = 1 / faceRho(c, c + 1); QW_[b + 1] = w; QN_[b + 1] = c + 1; sw += w; } else { QW_[b + 1] = 0; QN_[b + 1] = c; }
+    if (!vC_[vi(i, j)]) { const w = 1 / faceRho(c, c - GX_); QW_[b + 2] = w; QN_[b + 2] = c - GX_; sw += w; } else { QW_[b + 2] = 0; QN_[b + 2] = c; }
+    if (!vC_[vi(i, j + 1)]) { const w = 1 / faceRho(c, c + GX_); QW_[b + 3] = w; QN_[b + 3] = c + GX_; sw += w; } else { QW_[b + 3] = 0; QN_[b + 3] = c; }
+    if (!(sw > 0)) { Pr_[c] = 0; continue; }       // sealed in on all sides (or a broken density): nothing to solve
+    QI_[nl] = 1 / sw; LQL_[nl++] = c;
   }
   const iters = lqIters;
   for (let it = 0; it < iters; it++) {
     let md = 0;
     for (let q = 0; q < nl; q++) {
-      const c = LQL[q], b = q << 2;
-      const sp = QW[b] * Pr[QN[b]] + QW[b + 1] * Pr[QN[b + 1]] + QW[b + 2] * Pr[QN[b + 2]] + QW[b + 3] * Pr[QN[b + 3]];
-      const d = ((sp - Dv[c]) * QI[q] - Pr[c]) * L_SOR;
-      Pr[c] += d;
+      const c = LQL_[q], b = q << 2;
+      const sp = QW_[b] * Pr_[QN_[b]] + QW_[b + 1] * Pr_[QN_[b + 1]] + QW_[b + 2] * Pr_[QN_[b + 2]] + QW_[b + 3] * Pr_[QN_[b + 3]];
+      const d = ((sp - Dv_[c]) * QI_[q] - Pr_[c]) * L_SOR;
+      Pr_[c] += d;
       const ad = d < 0 ? -d : d; if (ad > md) md = ad;
     }
     if (it >= 7 && md < L_TOL) break;               // settled water converges in a handful of sweeps (the pressure is warm-started)
   }
-  for (let j = 0; j < GY; j++) for (let i = 1; i < GX; i++) {
-    const a = j * GX + i - 1, b = a + 1;
-    if (uC[ui(i, j)] || (cTyp[a] !== 1 && cTyp[b] !== 1)) continue;
-    U[ui(i, j)] -= (Pr[b] - Pr[a]) / faceRho(a, b);
+  for (let j = 0; j < GY_; j++) for (let i = 1; i < GX_; i++) {
+    const a = j * GX_ + i - 1, b = a + 1;
+    if (uC_[ui(i, j)] || (cTyp_[a] !== 1 && cTyp_[b] !== 1)) continue;
+    U_[ui(i, j)] -= (Pr_[b] - Pr_[a]) / faceRho(a, b);
   }
-  for (let j = 1; j < GY; j++) for (let i = 0; i < GX; i++) {
-    const a = (j - 1) * GX + i, b = a + GX;
-    if (vC[vi(i, j)] || (cTyp[a] !== 1 && cTyp[b] !== 1)) continue;
-    V[vi(i, j)] -= (Pr[b] - Pr[a]) / faceRho(a, b);
+  for (let j = 1; j < GY_; j++) for (let i = 0; i < GX_; i++) {
+    const a = (j - 1) * GX_ + i, b = a + GX_;
+    if (vC_[vi(i, j)] || (cTyp_[a] !== 1 && cTyp_[b] !== 1)) continue;
+    V_[vi(i, j)] -= (Pr_[b] - Pr_[a]) / faceRho(a, b);
   }
 }
 function gridToParticles() {
-  const GU = GX + 1;
+  const GX_ = GX, GY_ = GY, GN_ = GN, GS_ = GS;
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const px_ = px, py_ = py, pvx_ = pvx, pvy_ = pvy, pk_ = pk, U_ = U, UO_ = UO, V_ = V, VO_ = VO, cTyp_ = cTyp, cRho_ = cRho, LQ_FLIP_ = LQ_FLIP, LQ_DAMP_ = LQ_DAMP;
+  const GU = GX_ + 1;
   for (let k = 0; k < np; k++) {
-    const gx = px[k] / GS, gy = py[k] / GS, li = pk[k], a = LQ_FLIP[li];
-    const ci = (gy | 0) * GX + (gx | 0);
-    if (ci >= 0 && ci < GN && cTyp[ci] === 2) { pvy[k] += L_G; continue; }   // squeezed against a thin wall: fall freely
-    // bilinear taps for U/UO and V/VO share their indices and weights (same result as sampleU/sampleV, half the index maths)
+    const gx = px_[k] / GS_, gy = py_[k] / GS_, li = pk_[k], a = LQ_FLIP_[li];
+    const ci = (gy | 0) * GX_ + (gx | 0);
+    if (ci >= 0 && ci < GN_ && cTyp_[ci] === 2) { pvy_[k] += L_G; continue; }   // squeezed against a thin wall: fall freely
+    // bilinear taps for U_/UO_ and V_/VO_ share their indices and weights (same result as sampleU/sampleV, half the index maths)
     let i0 = Math.floor(gx), j0 = Math.floor(gy - 0.5), ax = gx - i0, ay = gy - 0.5 - j0;
-    let ia = i0 < 0 ? 0 : i0 > GX ? GX : i0, ib = i0 + 1 > GX ? GX : i0 + 1 < 0 ? 0 : i0 + 1;
-    let ja = j0 < 0 ? 0 : j0 >= GY ? GY - 1 : j0, jb = j0 + 1 < 0 ? 0 : j0 + 1 >= GY ? GY - 1 : j0 + 1;
+    let ia = i0 < 0 ? 0 : i0 > GX_ ? GX_ : i0, ib = i0 + 1 > GX_ ? GX_ : i0 + 1 < 0 ? 0 : i0 + 1;
+    let ja = j0 < 0 ? 0 : j0 >= GY_ ? GY_ - 1 : j0, jb = j0 + 1 < 0 ? 0 : j0 + 1 >= GY_ ? GY_ - 1 : j0 + 1;
     let w00 = (1 - ax) * (1 - ay), w10 = ax * (1 - ay), w01 = (1 - ax) * ay, w11 = ax * ay;
     let t00 = ja * GU + ia, t10 = ja * GU + ib, t01 = jb * GU + ia, t11 = jb * GU + ib;
-    const u = U[t00] * w00 + U[t10] * w10 + U[t01] * w01 + U[t11] * w11, uo = UO[t00] * w00 + UO[t10] * w10 + UO[t01] * w01 + UO[t11] * w11;
+    const u = U_[t00] * w00 + U_[t10] * w10 + U_[t01] * w01 + U_[t11] * w11, uo = UO_[t00] * w00 + UO_[t10] * w10 + UO_[t01] * w01 + UO_[t11] * w11;
     i0 = Math.floor(gx - 0.5); j0 = Math.floor(gy); ax = gx - 0.5 - i0; ay = gy - j0;
-    ia = i0 < 0 ? 0 : i0 >= GX ? GX - 1 : i0; ib = i0 + 1 < 0 ? 0 : i0 + 1 >= GX ? GX - 1 : i0 + 1;
-    ja = j0 < 0 ? 0 : j0 > GY ? GY : j0; jb = j0 + 1 < 0 ? 0 : j0 + 1 > GY ? GY : j0 + 1;
+    ia = i0 < 0 ? 0 : i0 >= GX_ ? GX_ - 1 : i0; ib = i0 + 1 < 0 ? 0 : i0 + 1 >= GX_ ? GX_ - 1 : i0 + 1;
+    ja = j0 < 0 ? 0 : j0 > GY_ ? GY_ : j0; jb = j0 + 1 < 0 ? 0 : j0 + 1 > GY_ ? GY_ : j0 + 1;
     w00 = (1 - ax) * (1 - ay); w10 = ax * (1 - ay); w01 = (1 - ax) * ay; w11 = ax * ay;
-    t00 = ja * GX + ia; t10 = ja * GX + ib; t01 = jb * GX + ia; t11 = jb * GX + ib;
-    const v = V[t00] * w00 + V[t10] * w10 + V[t01] * w01 + V[t11] * w11, vo = VO[t00] * w00 + VO[t10] * w10 + VO[t01] * w01 + VO[t11] * w11;
-    const fu = pvx[k] + u - uo, fv = pvy[k] + v - vo;
-    pvx[k] = (a * fu + (1 - a) * u) * LQ_DAMP[li];
-    pvy[k] = (a * fv + (1 - a) * v) * LQ_DAMP[li];
-    if (ci >= 0 && ci < GN) pvy[k] += L_G * 1.5 * (pRho(k) - cRho[ci]) / cRho[ci];
-    const s2 = pvx[k] * pvx[k] + pvy[k] * pvy[k];
-    if (s2 > L_VMAX * L_VMAX) { const f = L_VMAX / Math.sqrt(s2); pvx[k] *= f; pvy[k] *= f; }
+    t00 = ja * GX_ + ia; t10 = ja * GX_ + ib; t01 = jb * GX_ + ia; t11 = jb * GX_ + ib;
+    const v = V_[t00] * w00 + V_[t10] * w10 + V_[t01] * w01 + V_[t11] * w11, vo = VO_[t00] * w00 + VO_[t10] * w10 + VO_[t01] * w01 + VO_[t11] * w11;
+    const fu = pvx_[k] + u - uo, fv = pvy_[k] + v - vo;
+    pvx_[k] = (a * fu + (1 - a) * u) * LQ_DAMP_[li];
+    pvy_[k] = (a * fv + (1 - a) * v) * LQ_DAMP_[li];
+    if (ci >= 0 && ci < GN_) pvy_[k] += L_G * 1.5 * (pRho(k) - cRho_[ci]) / cRho_[ci];
+    const s2 = pvx_[k] * pvx_[k] + pvy_[k] * pvy_[k];
+    if (s2 > L_VMAX * L_VMAX) { const f = L_VMAX / Math.sqrt(s2); pvx_[k] *= f; pvy_[k] *= f; }
   }
 }
 function eject(k) {
@@ -626,8 +657,10 @@ function eject(k) {
   px[k] = -10; py[k] = -10;                         // off the map: removed in liquidsFromPixels
 }
 function advect() {
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const px_ = px, py_ = py, pvx_ = pvx, pvy_ = pvy;
   for (let k = 0; k < np; k++) {
-    let x = px[k], y = py[k], vx = pvx[k], vy = pvy[k];
+    let x = px_[k], y = py_[k], vx = pvx_[k], vy = pvy_[k];
     if (blocked(Math.floor(x), Math.floor(y))) { eject(k); continue; }
     const n = Math.min(8, Math.ceil(Math.max(Math.abs(vx), Math.abs(vy)) / 0.9) || 1);
     for (let s = 0; s < n; s++) {
@@ -640,35 +673,39 @@ function advect() {
       else if (!blocked(cx, ocy)) { y = oy; vy = 0; }
       else { x = ox; y = oy; vx = 0; vy = 0; }
     }
-    px[k] = x; py[k] = y; pvx[k] = vx; pvy[k] = vy;
+    px_[k] = x; py_[k] = y; pvx_[k] = vx; pvy_[k] = vy;
   }
 }
 // light separation so particles never pile into the same spot
-const HB = new Int32Array(N + 1), HC = new Int32Array(N), HI = new Int32Array(MAXP);
+const HB = new Int32Array(N + 1), HC = new Int32Array(N);
+let HI = new Int32Array(particleCapacity);
 function separate() {
+  const W_ = W, H_ = H, N_ = N;
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const px_ = px, py_ = py, HB_ = HB, HC_ = HC, HI_ = HI;
   if (np === 0) return;
   // only the rows that hold liquid (plus one either side for the neighbour lookups) are cleared and prefix-summed
-  let ymin = H, ymax = -1;
-  for (let k = 0; k < np; k++) { const y = py[k] | 0; if (y < ymin) ymin = y; if (y > ymax) ymax = y; }
-  if (ymin < 0) ymin = 0; if (ymax >= H) ymax = H - 1;
-  const b0 = Math.max(0, ymin - 1) * W, b1 = Math.min(H, ymax + 2) * W;
-  HB.fill(0, b0, b1 + 1);
-  for (let k = 0; k < np; k++) { const c = (py[k] | 0) * W + (px[k] | 0); if (c >= b0 && c < b1) HB[c + 1]++; }
-  for (let c = b0; c < b1; c++) { HB[c + 1] += HB[c]; HC[c] = HB[c]; }
-  for (let k = 0; k < np; k++) { const c = (py[k] | 0) * W + (px[k] | 0); if (c >= 0 && c < N) HI[HC[c]++] = k; }
+  let ymin = H_, ymax = -1;
+  for (let k = 0; k < np; k++) { const y = py_[k] | 0; if (y < ymin) ymin = y; if (y > ymax) ymax = y; }
+  if (ymin < 0) ymin = 0; if (ymax >= H_) ymax = H_ - 1;
+  const b0 = Math.max(0, ymin - 1) * W_, b1 = Math.min(H_, ymax + 2) * W_;
+  HB_.fill(0, b0, b1 + 1);
+  for (let k = 0; k < np; k++) { const c = (py_[k] | 0) * W_ + (px_[k] | 0); if (c >= b0 && c < b1) HB_[c + 1]++; }
+  for (let c = b0; c < b1; c++) { HB_[c + 1] += HB_[c]; HC_[c] = HB_[c]; }
+  for (let k = 0; k < np; k++) { const c = (py_[k] | 0) * W_ + (px_[k] | 0); if (c >= 0 && c < N_) HI_[HC_[c]++] = k; }
   const R = 0.9, R2 = R * R;
   for (let k = 0; k < np; k++) {
-    const cx = px[k] | 0, cy = py[k] | 0;
+    const cx = px_[k] | 0, cy = py_[k] | 0;
     let mx = 0, my = 0;
     for (let yy = cy - 1; yy <= cy + 1; yy++) {
-      if (yy < 0 || yy >= H) continue;
+      if (yy < 0 || yy >= H_) continue;
       for (let xx = cx - 1; xx <= cx + 1; xx++) {
-        if (xx < 0 || xx >= W) continue;
-        const c = yy * W + xx;
-        for (let m = HB[c]; m < HB[c + 1]; m++) {
-          const j = HI[m];
+        if (xx < 0 || xx >= W_) continue;
+        const c = yy * W_ + xx;
+        for (let m = HB_[c]; m < HB_[c + 1]; m++) {
+          const j = HI_[m];
           if (j === k) continue;
-          const dx = px[k] - px[j], dy = py[k] - py[j], d2 = dx * dx + dy * dy;
+          const dx = px_[k] - px_[j], dy = py_[k] - py_[j], d2 = dx * dx + dy * dy;
           if (d2 >= R2) continue;
           if (d2 < 1e-6) { mx += Math.random() - 0.5; my += Math.random() - 0.5; continue; }
           const d = Math.sqrt(d2), f = (R - d) / d * 0.25;
@@ -678,8 +715,8 @@ function separate() {
     }
     const m2 = mx * mx + my * my;
     if (m2 > 0.2) { const f = 0.45 / Math.sqrt(m2); mx *= f; my *= f; }
-    const nx = px[k] + mx, ny = py[k] + my;
-    if (!blocked(Math.floor(nx), Math.floor(ny))) { px[k] = nx; py[k] = ny; }
+    const nx = px_[k] + mx, ny = py_[k] + my;
+    if (!blocked(Math.floor(nx), Math.floor(ny))) { px_[k] = nx; py_[k] = ny; }
   }
 }
 function liquidPhysics() {
@@ -698,20 +735,23 @@ function liquidPhysics() {
   if (qLevel < 1 || (qLevel < 3 ? (frame & 1) : frame % 3 === 0)) separate();   // spacing pass every 2nd / 3rd frame when the device is struggling
 }
 function liquidsToPixels() {
-  lOcc.fill(0); lKind.fill(-1);
+  const W_ = W;
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const px_ = px, py_ = py, pt_ = pt, pk_ = pk, lOcc_ = lOcc, lKind_ = lKind, tSum_ = tSum, type_ = type, temp_ = temp;
+  lOcc_.fill(0); lKind_.fill(-1);
   for (let k = 0; k < np; k++) {
-    const x = Math.floor(px[k]), y = Math.floor(py[k]);
+    const x = Math.floor(px_[k]), y = Math.floor(py_[k]);
     if (!inb(x, y)) continue;
-    const c = y * W + x;
-    if (lOcc[c] === 0) tSum[c] = 0;
-    if (lOcc[c] < 255) lOcc[c]++;
-    tSum[c] += pt[k]; lKind[c] = pk[k];
+    const c = y * W_ + x;
+    if (lOcc_[c] === 0) tSum_[c] = 0;
+    lOcc_[c]++;
+    tSum_[c] += pt_[k]; lKind_[c] = pk_[k];
   }
   for (let k = 0; k < np; k++) {
-    const x = Math.floor(px[k]), y = Math.floor(py[k]);
+    const x = Math.floor(px_[k]), y = Math.floor(py_[k]);
     if (!inb(x, y)) continue;
-    const c = y * W + x;
-    if (type[c] === 0) temp[c] = tSum[c] / lOcc[c];   // the pixel carries the liquid's heat for conduction
+    const c = y * W_ + x;
+    if (type_[c] === 0) temp_[c] = tSum_[c] / lOcc_[c];   // the pixel carries the liquid's heat for conduction
   }
 }
 function oilFlameNear(x, y) {
@@ -1188,108 +1228,111 @@ function sampleCell(a, gx, gy) {  // bilinear on cell centres of the coarse air 
   return (a[c] * (1 - ax) + a[c + 1] * ax) * (1 - ay) + (a[c + GX] * (1 - ax) + a[c + GX + 1] * ax) * ay;
 }
 function airVelocity() {
-  if (pxOn) { for (let c = 0; c < GN; c++) { AX[c] -= PXv[c]; AY[c] -= PYv[c]; } pxOn = false; }   // the incompressible solve sees only the wind; pressure flow is added back after it
+  const W_ = W, GX_ = GX, GY_ = GY, GN_ = GN, GS_ = GS;
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const AX_ = AX, AY_ = AY, PXv_ = PXv, PYv_ = PYv, AP_ = AP, PR_ = PR, PGX_ = PGX, PGY_ = PGY, PDV_ = PDV, FU_ = FU, FV_ = FV, FT_ = FT, PRS_ = PRS, type_ = type, lOcc_ = lOcc, temp_ = temp, gS_ = gS, gK_ = gK, gH_ = gH, ACK_ = ACK, ACH_ = ACH, ASol_ = ASol, ACT_ = ACT, ACS_ = ACS, AEx_ = AEx, GDN_ = GDN, AVort_ = AVort, AX2_ = AX2, AY2_ = AY2, AD_ = AD;
+  if (pxOn) { for (let c = 0; c < GN_; c++) { AX_[c] -= PXv_[c]; AY_[c] -= PYv_[c]; } pxOn = false; }   // the incompressible solve sees only the wind; pressure flow is added back after it
   // what is solid for air: cells mostly filled by solids or liquid
-  let i0 = GX, i1 = -1, j0 = GY, j1 = -1, pi0 = GX, pi1 = -1, pj0 = GY, pj1 = -1;
-  for (let j = 0; j < GY; j++) for (let i = 0; i < GX; i++) {
-    const c = j * GX + i, p0 = j * GS * W + i * GS, p1 = p0 + 1, p2 = p0 + W, p3 = p2 + 1;
+  let i0 = GX_, i1 = -1, j0 = GY_, j1 = -1, pi0 = GX_, pi1 = -1, pj0 = GY_, pj1 = -1;
+  for (let j = 0; j < GY_; j++) for (let i = 0; i < GX_; i++) {
+    const c = j * GX_ + i, p0 = j * GS_ * W_ + i * GS_, p1 = p0 + 1, p2 = p0 + W_, p3 = p2 + 1;
     let ts = 0, ss = 0, na = 0, ks = 0, hs = 0;
     // the four pixels of this air cell, unrolled (this scan runs over the whole map every frame)
-    if (type[p0] === 0 && lOcc[p0] === 0) { ts += temp[p0]; ss += gS[p0]; ks += gK[p0]; hs += gH[p0]; na++; }
-    if (type[p1] === 0 && lOcc[p1] === 0) { ts += temp[p1]; ss += gS[p1]; ks += gK[p1]; hs += gH[p1]; na++; }
-    if (type[p2] === 0 && lOcc[p2] === 0) { ts += temp[p2]; ss += gS[p2]; ks += gK[p2]; hs += gH[p2]; na++; }
-    if (type[p3] === 0 && lOcc[p3] === 0) { ts += temp[p3]; ss += gS[p3]; ks += gK[p3]; hs += gH[p3]; na++; }
+    if (type_[p0] === 0 && lOcc_[p0] === 0) { ts += temp_[p0]; ss += gS_[p0]; ks += gK_[p0]; hs += gH_[p0]; na++; }
+    if (type_[p1] === 0 && lOcc_[p1] === 0) { ts += temp_[p1]; ss += gS_[p1]; ks += gK_[p1]; hs += gH_[p1]; na++; }
+    if (type_[p2] === 0 && lOcc_[p2] === 0) { ts += temp_[p2]; ss += gS_[p2]; ks += gK_[p2]; hs += gH_[p2]; na++; }
+    if (type_[p3] === 0 && lOcc_[p3] === 0) { ts += temp_[p3]; ss += gS_[p3]; ks += gK_[p3]; hs += gH_[p3]; na++; }
     const sol = 4 - na;
-    ACK[c] = na ? ks / na : 0; ACH[c] = na ? hs / na : 0;
-    ASol[c] = sol >= 2 ? 1 : 0;                       // a 1px wall is still a wall for air
-    ACT[c] = na ? ts / na : AMBIENT; ACS[c] = na ? ss / na : 0;
+    ACK_[c] = na ? ks / na : 0; ACH_[c] = na ? hs / na : 0;
+    ASol_[c] = sol >= 2 ? 1 : 0;                       // a 1px wall is still a wall for air
+    ACT_[c] = na ? ts / na : AMBIENT; ACS_[c] = na ? ss / na : 0;
     // the air only needs solving where it moves or something drives it (heat, smoke, a blast)
     // pressure has its own working box (a pressure wave covers the whole map, the wind usually doesn't)
-    if (!ASol[c] && (PR[c] > 0.02 || PR[c] < -0.02 || AEx[c] !== 0 || GDN[c] > P_GDEN || PXv[c] !== 0 || PYv[c] !== 0)) {
+    if (!ASol_[c] && (PR_[c] > 0.02 || PR_[c] < -0.02 || AEx_[c] !== 0 || GDN_[c] > P_GDEN || PXv_[c] !== 0 || PYv_[c] !== 0)) {
       if (i < pi0) pi0 = i; if (i > pi1) pi1 = i; if (j < pj0) pj0 = j; if (j > pj1) pj1 = j;
     }
-    if (!ASol[c] && (Math.abs(AX[c]) + Math.abs(AY[c]) > 1e-3 || Math.abs(ACT[c] - AMBIENT) > 0.5 || ACS[c] > 1e-3 || ACK[c] > 1e-3 || ACH[c] > 1e-3 || AEx[c] !== 0)) {
+    if (!ASol_[c] && (Math.abs(AX_[c]) + Math.abs(AY_[c]) > 1e-3 || Math.abs(ACT_[c] - AMBIENT) > 0.5 || ACS_[c] > 1e-3 || ACK_[c] > 1e-3 || ACH_[c] > 1e-3 || AEx_[c] !== 0)) {
       if (i < i0) i0 = i; if (i > i1) i1 = i; if (j < j0) j0 = j; if (j > j1) j1 = j;
     }
   }
-  if (i1 < 0 && pi1 < 0) { AX.fill(0); AY.fill(0); AP.fill(0); if (pxLive || presActive) { PR.fill(0); PXv.fill(0); PYv.fill(0); PGX.fill(0); PGY.fill(0); PDV.fill(0); FU.fill(0); FV.fill(0); FT.fill(0); PRS.fill(0); } presActive = false; pxLive = false; airMax2 = 0; pvMax2 = 0; return; }   // still air everywhere: nothing to do
-  if (i1 < 0) { AX.fill(0); AY.fill(0); AP.fill(0); }
+  if (i1 < 0 && pi1 < 0) { AX_.fill(0); AY_.fill(0); AP_.fill(0); if (pxLive || presActive) { PR_.fill(0); PXv_.fill(0); PYv_.fill(0); PGX_.fill(0); PGY_.fill(0); PDV_.fill(0); FU_.fill(0); FV_.fill(0); FT_.fill(0); PRS_.fill(0); } presActive = false; pxLive = false; airMax2 = 0; pvMax2 = 0; return; }   // still air everywhere: nothing to do
+  if (i1 < 0) { AX_.fill(0); AY_.fill(0); AP_.fill(0); }
   else {
   const PAD = 10;
-  i0 = Math.max(0, i0 - PAD); i1 = Math.min(GX - 1, i1 + PAD); j0 = Math.max(0, j0 - PAD); j1 = Math.min(GY - 1, j1 + PAD);
+  i0 = Math.max(0, i0 - PAD); i1 = Math.min(GX_ - 1, i1 + PAD); j0 = Math.max(0, j0 - PAD); j1 = Math.min(GY_ - 1, j1 + PAD);
   // outside the working box the air is at rest
-  for (let j = 0; j < GY; j++) for (let i = 0; i < GX; i++) {
+  for (let j = 0; j < GY_; j++) for (let i = 0; i < GX_; i++) {
     if (i >= i0 && i <= i1 && j >= j0 && j <= j1) continue;
-    const c = j * GX + i; AX[c] = 0; AY[c] = 0; AP[c] = 0;
+    const c = j * GX_ + i; AX_[c] = 0; AY_[c] = 0; AP_[c] = 0;
   }
   // forces: hot air rises, smoke is a little heavy, vorticity confinement keeps the swirls alive
-  for (let j = Math.max(1, j0); j <= Math.min(GY - 2, j1); j++) for (let i = Math.max(1, i0); i <= Math.min(GX - 2, i1); i++) {
-    const c = j * GX + i;
-    AVort[c] = (AY[c + 1] - AY[c - 1] - AX[c + GX] + AX[c - GX]) * 0.5;
+  for (let j = Math.max(1, j0); j <= Math.min(GY_ - 2, j1); j++) for (let i = Math.max(1, i0); i <= Math.min(GX_ - 2, i1); i++) {
+    const c = j * GX_ + i;
+    AVort_[c] = (AY_[c + 1] - AY_[c - 1] - AX_[c + GX_] + AX_[c - GX_]) * 0.5;
   }
   for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
-    const c = j * GX + i;
-    if (ASol[c]) { AX[c] = 0; AY[c] = 0; continue; }
-    AY[c] -= A_BUOY * (ACT[c] - AMBIENT) - A_SMOKEW * Math.min(ACS[c], 1.2) - 0.08 * Math.min(ACK[c], 3) + 0.02 * ACH[c];   // CO2 sinks and pools, hydrogen shoots up
-    if (i > 1 && i < GX - 2 && j > 1 && j < GY - 2 && i > i0 && i < i1 && j > j0 && j < j1) {
-      let nx = (Math.abs(AVort[c + 1]) - Math.abs(AVort[c - 1])) * 0.5, ny = (Math.abs(AVort[c + GX]) - Math.abs(AVort[c - GX])) * 0.5;
+    const c = j * GX_ + i;
+    if (ASol_[c]) { AX_[c] = 0; AY_[c] = 0; continue; }
+    AY_[c] -= A_BUOY * (ACT_[c] - AMBIENT) - A_SMOKEW * Math.min(ACS_[c], 1.2) - 0.08 * Math.min(ACK_[c], 3) + 0.02 * ACH_[c];   // CO2 sinks and pools, hydrogen shoots up
+    if (i > 1 && i < GX_ - 2 && j > 1 && j < GY_ - 2 && i > i0 && i < i1 && j > j0 && j < j1) {
+      let nx = (Math.abs(AVort_[c + 1]) - Math.abs(AVort_[c - 1])) * 0.5, ny = (Math.abs(AVort_[c + GX_]) - Math.abs(AVort_[c - GX_])) * 0.5;
       const l = Math.sqrt(nx * nx + ny * ny) + 1e-5; nx /= l; ny /= l;
-      AX[c] += A_VORT * ny * AVort[c]; AY[c] -= A_VORT * nx * AVort[c];
+      AX_[c] += A_VORT * ny * AVort_[c]; AY_[c] -= A_VORT * nx * AVort_[c];
     }
   }
   // advect velocity along itself (semi-Lagrangian)
   for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
-    const c = j * GX + i;
-    if (ASol[c]) { AX2[c] = 0; AY2[c] = 0; continue; }
-    const bx = i + 0.5 - AX[c] / GS, by = j + 0.5 - AY[c] / GS;
-    AX2[c] = sampleCell(AX, bx, by) * 0.995; AY2[c] = sampleCell(AY, bx, by) * 0.995;
+    const c = j * GX_ + i;
+    if (ASol_[c]) { AX2_[c] = 0; AY2_[c] = 0; continue; }
+    const bx = i + 0.5 - AX_[c] / GS_, by = j + 0.5 - AY_[c] / GS_;
+    AX2_[c] = sampleCell(AX_, bx, by) * 0.995; AY2_[c] = sampleCell(AY_, bx, by) * 0.995;
   }
-  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) { const c = j * GX + i; AX[c] = AX2[c]; AY[c] = AY2[c]; }
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) { const c = j * GX_ + i; AX_[c] = AX2_[c]; AY_[c] = AY2_[c]; }
   // make it incompressible (open top: air can leave upward)
   for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
-    const c = j * GX + i;
-    if (ASol[c]) { AD[c] = 0; continue; }
-    const xr = i < GX - 1 && !ASol[c + 1] ? AX[c + 1] : 0, xl = i > 0 && !ASol[c - 1] ? AX[c - 1] : 0;
-    const yd = j < GY - 1 && !ASol[c + GX] ? AY[c + GX] : 0, yu = j > 0 ? (!ASol[c - GX] ? AY[c - GX] : 0) : AY[c];
+    const c = j * GX_ + i;
+    if (ASol_[c]) { AD_[c] = 0; continue; }
+    const xr = i < GX_ - 1 && !ASol_[c + 1] ? AX_[c + 1] : 0, xl = i > 0 && !ASol_[c - 1] ? AX_[c - 1] : 0;
+    const yd = j < GY_ - 1 && !ASol_[c + GX_] ? AY_[c + GX_] : 0, yu = j > 0 ? (!ASol_[c - GX_] ? AY_[c - GX_] : 0) : AY_[c];
     // (the pressure below solves  laplacian(p) = divergence  exactly once: it used to solve for twice the divergence, so every
     //  projection overshot, the air sloshed back and forth and wind kept ringing long after it stopped)
-    AD[c] = (xr - xl + yd - yu) * 0.5 - AEx[c] * 3;
+    AD_[c] = (xr - xl + yd - yu) * 0.5 - AEx_[c] * 3;
   }
   for (let it = 0; it < A_ITERS; it++) {
     for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
-      const c = j * GX + i;
-      if (ASol[c]) continue;
-      const pl = i > 0 && !ASol[c - 1] ? AP[c - 1] : AP[c];
-      const pr = i < GX - 1 && !ASol[c + 1] ? AP[c + 1] : AP[c];
-      const pu = j > 0 ? (!ASol[c - GX] ? AP[c - GX] : AP[c]) : 0;
-      const pd = j < GY - 1 && !ASol[c + GX] ? AP[c + GX] : AP[c];
-      AP[c] += A_SOR * ((pl + pr + pu + pd - AD[c]) * 0.25 - AP[c]);
+      const c = j * GX_ + i;
+      if (ASol_[c]) continue;
+      const pl = i > 0 && !ASol_[c - 1] ? AP_[c - 1] : AP_[c];
+      const pr = i < GX_ - 1 && !ASol_[c + 1] ? AP_[c + 1] : AP_[c];
+      const pu = j > 0 ? (!ASol_[c - GX_] ? AP_[c - GX_] : AP_[c]) : 0;
+      const pd = j < GY_ - 1 && !ASol_[c + GX_] ? AP_[c + GX_] : AP_[c];
+      AP_[c] += A_SOR * ((pl + pr + pu + pd - AD_[c]) * 0.25 - AP_[c]);
     }
   }
   for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
-    const c = j * GX + i;
-    if (ASol[c]) continue;
-    const pl = i > 0 && !ASol[c - 1] ? AP[c - 1] : AP[c];
-    const pr = i < GX - 1 && !ASol[c + 1] ? AP[c + 1] : AP[c];
-    const pu = j > 0 ? (!ASol[c - GX] ? AP[c - GX] : AP[c]) : 0;
-    const pd = j < GY - 1 && !ASol[c + GX] ? AP[c + GX] : AP[c];
-    AX[c] -= (pr - pl) * 0.5; AY[c] -= (pd - pu) * 0.5;
-    const s2 = AX[c] * AX[c] + AY[c] * AY[c];
-    if (s2 > A_VMAX * A_VMAX) { const f = A_VMAX / Math.sqrt(s2); AX[c] *= f; AY[c] *= f; }
+    const c = j * GX_ + i;
+    if (ASol_[c]) continue;
+    const pl = i > 0 && !ASol_[c - 1] ? AP_[c - 1] : AP_[c];
+    const pr = i < GX_ - 1 && !ASol_[c + 1] ? AP_[c + 1] : AP_[c];
+    const pu = j > 0 ? (!ASol_[c - GX_] ? AP_[c - GX_] : AP_[c]) : 0;
+    const pd = j < GY_ - 1 && !ASol_[c + GX_] ? AP_[c + GX_] : AP_[c];
+    AX_[c] -= (pr - pl) * 0.5; AY_[c] -= (pd - pu) * 0.5;
+    const s2 = AX_[c] * AX_[c] + AY_[c] * AY_[c];
+    if (s2 > A_VMAX * A_VMAX) { const f = A_VMAX / Math.sqrt(s2); AX_[c] *= f; AY_[c] *= f; }
   }
   }
   if (pi1 >= 0) {
     const PP = 12;
-    pi0 = Math.max(0, pi0 - PP); pi1 = Math.min(GX - 1, pi1 + PP); pj0 = Math.max(0, pj0 - PP); pj1 = Math.min(GY - 1, pj1 + PP);
-    for (let j = 0; j < GY; j++) for (let i = 0; i < GX; i++) {
+    pi0 = Math.max(0, pi0 - PP); pi1 = Math.min(GX_ - 1, pi1 + PP); pj0 = Math.max(0, pj0 - PP); pj1 = Math.min(GY_ - 1, pj1 + PP);
+    for (let j = 0; j < GY_; j++) for (let i = 0; i < GX_; i++) {
       if (i >= pi0 && i <= pi1 && j >= pj0 && j <= pj1) continue;
-      const c = j * GX + i; PR[c] = 0; PXv[c] = 0; PYv[c] = 0; PGX[c] = 0; PGY[c] = 0; FU[c] = 0; FV[c] = 0; PRS[c] = 0; if (j === 0) FT[i] = 0;
+      const c = j * GX_ + i; PR_[c] = 0; PXv_[c] = 0; PYv_[c] = 0; PGX_[c] = 0; PGY_[c] = 0; FU_[c] = 0; FV_[c] = 0; PRS_[c] = 0; if (j === 0) FT_[i] = 0;
     }
     pressureStep(pi0, pi1, pj0, pj1);
   } else {
-    if (pxLive) { PR.fill(0); PXv.fill(0); PYv.fill(0); PGX.fill(0); PGY.fill(0); FU.fill(0); FV.fill(0); FT.fill(0); PRS.fill(0); }
+    if (pxLive) { PR_.fill(0); PXv_.fill(0); PYv_.fill(0); PGX_.fill(0); PGY_.fill(0); FU_.fill(0); FV_.fill(0); FT_.fill(0); PRS_.fill(0); }
     presActive = false; pxLive = false; pvMax2 = 0;
-    let m2 = 0; for (let c = 0; c < GN; c++) { const s2 = AX[c] * AX[c] + AY[c] * AY[c]; if (s2 > m2) m2 = s2; } airMax2 = m2;
+    let m2 = 0; for (let c = 0; c < GN_; c++) { const s2 = AX_[c] * AX_[c] + AY_[c] * AY_[c]; if (s2 > m2) m2 = s2; } airMax2 = m2;
   }
 }
 const advIn = [gS, gV, gM, gF, gK, gH, temp], ADV_T = 6;
@@ -1348,52 +1391,54 @@ function advectGases() {
   }
 }
 function gasChemistry() {
-  AEx.fill(0);
-  if (gasIdle) return;                                  // no gas, flame or hot air on the map: nothing can react (gIgn is already clear)
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const AEx_ = AEx, gAct2_ = gAct2, CI_ = CI, gIgn_ = gIgn, gM_ = gM, temp_ = temp, gF_ = gF, gS_ = gS, gK_ = gK, gV_ = gV, gH_ = gH, gC_ = gC, IGN_ = IGN;
+  AEx_.fill(0);
+  if (gasIdle) return;                                  // no gas, flame or hot air on the map: nothing can react (gIgn_ is already clear)
   for (let i = 0; i < N; i++) {
-    if (!gAct2[CI[i]]) { gIgn[i] = 0; continue; }   // nothing in the air here
+    if (!gAct2_[CI_[i]]) { gIgn_[i] = 0; continue; }   // nothing in the air here
     if (!isAir(i)) continue;
-    let T = temp[i];
+    let T = temp_[i];
     // methane (and oil vapour) burns when hot enough: heat, flame and a little soot
-    if (gM[i] > 0.005 && T > IGN[ID.GAS]) {
-      const r = Math.min(gM[i], 0.04 + gM[i] * 0.3);
-      gM[i] -= r; T += r * 1400; if (T > 1700) T = 1700;
-      gF[i] = Math.min(1.1, gF[i] + r * 2.2); gS[i] += r * 0.06; gK[i] += r * 0.4;
+    if (gM_[i] > 0.005 && T > IGN_[ID.GAS]) {
+      const r = Math.min(gM_[i], 0.04 + gM_[i] * 0.3);
+      gM_[i] -= r; T += r * 1400; if (T > 1700) T = 1700;
+      gF_[i] = Math.min(1.1, gF_[i] + r * 2.2); gS_[i] += r * 0.06; gK_[i] += r * 0.4;
       // the flame front runs through the mixture: the burning pocket lights the gas next to it
       const x = i % W;
-      if (x > 0 && gM[i - 1] > 0.005 && Math.random() < 0.8) gIgn[i - 1] = 1;
-      if (x < W - 1 && gM[i + 1] > 0.005 && Math.random() < 0.8) gIgn[i + 1] = 1;
-      if (i >= W && gM[i - W] > 0.005) gIgn[i - W] = 1;            // fire climbs faster than it sinks
-      if (i < N - W && gM[i + W] > 0.005 && Math.random() < 0.5) gIgn[i + W] = 1;
+      if (x > 0 && gM_[i - 1] > 0.005 && Math.random() < 0.8) gIgn_[i - 1] = 1;
+      if (x < W - 1 && gM_[i + 1] > 0.005 && Math.random() < 0.8) gIgn_[i + 1] = 1;
+      if (i >= W && gM_[i - W] > 0.005) gIgn_[i - W] = 1;            // fire climbs faster than it sinks
+      if (i < N - W && gM_[i + W] > 0.005 && Math.random() < 0.5) gIgn_[i + W] = 1;
       // hot burnt gas expands
-      AEx[((i / W | 0) / GS | 0) * GX + (x / GS | 0)] += r * 0.9;
+      AEx_[((i / W | 0) / GS | 0) * GX + (x / GS | 0)] += r * 0.9;
     }
     if (T > 400) T -= (T - 400) * 0.02;              // burnt gas radiates its heat away
-    if (gH[i] > 0.005 && T > IGN[ID.HYDROGEN]) {
-      const r = Math.min(gH[i], 0.08 + gH[i] * 0.5);
-      gH[i] -= r; T += r * 2200; if (T > 2400) T = 2400;
-      gF[i] = Math.min(1.1, gF[i] + r * 1.4); gV[i] += r * 0.6;           // it burns into water vapour, almost no smoke
+    if (gH_[i] > 0.005 && T > IGN_[ID.HYDROGEN]) {
+      const r = Math.min(gH_[i], 0.08 + gH_[i] * 0.5);
+      gH_[i] -= r; T += r * 2200; if (T > 2400) T = 2400;
+      gF_[i] = Math.min(1.1, gF_[i] + r * 1.4); gV_[i] += r * 0.6;           // it burns into water vapour, almost no smoke
       const x = i % W;
-      if (x > 0 && gH[i - 1] > 0.005) gIgn[i - 1] = 1; if (x < W - 1 && gH[i + 1] > 0.005) gIgn[i + 1] = 1;
-      if (i >= W && gH[i - W] > 0.005) gIgn[i - W] = 1; if (i < N - W && gH[i + W] > 0.005) gIgn[i + W] = 1;
-      AEx[((i / W | 0) / GS | 0) * GX + (x / GS | 0)] += r * 1.6;
+      if (x > 0 && gH_[i - 1] > 0.005) gIgn_[i - 1] = 1; if (x < W - 1 && gH_[i + 1] > 0.005) gIgn_[i + 1] = 1;
+      if (i >= W && gH_[i - W] > 0.005) gIgn_[i - W] = 1; if (i < N - W && gH_[i + W] > 0.005) gIgn_[i + W] = 1;
+      AEx_[((i / W | 0) / GS | 0) * GX + (x / GS | 0)] += r * 1.6;
     }
-    if (gK[i] > 0.02) { gF[i] *= Math.max(0.3, 1 - gK[i] * 4); if (T > 200) T -= (T - 200) * Math.min(0.25, gK[i]); }   // CO2 starves flames of oxygen and cools the plume
-    if (gK[i] > 0) { gK[i] *= 0.9995; if (gK[i] < 0.002) gK[i] = 0; }
-    if (gH[i] > 0) { gH[i] *= 0.9995; if (gH[i] < 0.002) gH[i] = 0; }
-    gF[i] *= 0.9;                                    // flame light fades quickly
-    if (gF[i] < 0.003) gF[i] = 0;
-    gS[i] *= 0.9985;                                 // smoke slowly thins out
-    if (gS[i] < 0.002) gS[i] = 0;
+    if (gK_[i] > 0.02) { gF_[i] *= Math.max(0.3, 1 - gK_[i] * 4); if (T > 200) T -= (T - 200) * Math.min(0.25, gK_[i]); }   // CO2 starves flames of oxygen and cools the plume
+    if (gK_[i] > 0) { gK_[i] *= 0.9995; if (gK_[i] < 0.002) gK_[i] = 0; }
+    if (gH_[i] > 0) { gH_[i] *= 0.9995; if (gH_[i] < 0.002) gH_[i] = 0; }
+    gF_[i] *= 0.9;                                    // flame light fades quickly
+    if (gF_[i] < 0.003) gF_[i] = 0;
+    gS_[i] *= 0.9985;                                 // smoke slowly thins out
+    if (gS_[i] < 0.002) gS_[i] = 0;
     // steam condenses back into water droplets as it cools
-    if (gV[i] > 0.01 && T < 95) {
-      const c = Math.min(gV[i], 0.002 + (95 - T) * 0.0001);
-      gV[i] -= c; gC[i] += c;
-      if (gC[i] >= 1) { gC[i] -= 1; spawnLiquidInCell(ID.WATER, i, Math.min(T, 60)); }
+    if (gV_[i] > 0.01 && T < 95) {
+      const c = Math.min(gV_[i], 0.002 + (95 - T) * 0.0001);
+      gV_[i] -= c; gC_[i] += c;
+      if (gC_[i] >= 1) { gC_[i] -= 1; spawnLiquidInCell(ID.WATER, i, Math.min(T, 60)); }
     }
-    temp[i] = T;
+    temp_[i] = T;
   }
-  for (let i = 0; i < N; i++) if (gIgn[i]) { gIgn[i] = 0; const ig = gH[i] > 0.005 ? IGN[ID.HYDROGEN] + 30 : IGN[ID.GAS] + 30; if (temp[i] < ig) temp[i] = ig; }
+  for (let i = 0; i < N; i++) if (gIgn_[i]) { gIgn_[i] = 0; const ig = gH_[i] > 0.005 ? IGN_[ID.HYDROGEN] + 30 : IGN_[ID.GAS] + 30; if (temp_[i] < ig) temp_[i] = ig; }
 }
 function airStep() {
   airVelocity();
@@ -1422,6 +1467,7 @@ function setCell(i, t) {
   if (KIND[t] === 3) { spawnLiquidInCell(t, i); return; }
   if (KIND[t] === 4) { addGas(i, t, 1); return; }
   type[i] = t;
+  texU[i] = i % W; texV[i] = (i / W) | 0;
   temp[i] = DEFS[t].t0;
   vel[i] = 0; hv[i] = 0; grp[i] = setGrp; dmg[i] = 0; soot[i] = 0;
   life[i] = t === ID.FIRE ? 30 + (Math.random() * 30 | 0) : t === ID.SMOKE ? 150 + (Math.random() * 150 | 0) : 0;
@@ -2718,27 +2764,46 @@ function condOf(i) {
   return gF[i] > 0.05 ? 0.35 : temp[i] > 200 ? 0.08 : COND[0];   // flames and hot gas heat what they touch fast
 }
 const kCond = new Float32Array(N);
+const thermalRows = new Uint8Array(H), condRows = new Uint8Array(H);
 function conduct() {
-  // pass 1: conductivity of every pixel once (the old code worked it out three times per pixel, with function calls)
-  for (let i = 0; i < N; i++) {
-    const t = type[i];
-    kCond[i] = t ? COND[t] : lOcc[i] ? LQ_COND[lKind[i]] : gF[i] > 0.05 ? 0.35 : temp[i] > 200 ? 0.08 : COND[0];
+  const W_ = W, H_ = H;
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const type_ = type, temp_ = temp, kCond_ = kCond, COND_ = COND, lOcc_ = lOcc, LQ_COND_ = LQ_COND, lKind_ = lKind, gF_ = gF;
+  // Ambient rows exchange exactly zero heat. Detect them cheaply, then calculate
+  // conductivity only for rows the diffusion actually reaches (including new heat this tick).
+  thermalRows.fill(0); condRows.fill(0);
+  for (let y = 0; y < H_; y++) {
+    for (let i = y * W_, end = i + W_; i < end; i++) {
+      if (temp_[i] !== AMBIENT) { thermalRows[y] = 1; break; }
+    }
   }
-  // pass 2: same diffusion as before, plain array reads
-  for (let y = 0; y < H; y++) {
-    const row = y * W, last = y + 1 < H;
-    for (let x = 0; x < W; x++) {
-      const i = row + x, ki = kCond[i];
-      let Ti = temp[i];
-      if (x + 1 < W) {
-        const j = i + 1, kj = kCond[j], d = (Ti - temp[j]) * (ki < kj ? ki : kj) * 0.25;
-        Ti -= d; temp[j] += d;
+  const conductivityRow = (y, ambient = true) => {
+    if (condRows[y]) return;
+    for (let i = y * W_, end = i + W_; i < end; i++) {
+      const t = type_[i];
+      kCond_[i] = t ? COND_[t] : lOcc_[i] ? LQ_COND_[lKind_[i]] : gF_[i] > 0.05 ? 0.35 : !ambient && temp_[i] > 200 ? 0.08 : COND_[0];
+    }
+    condRows[y] = 1;
+  };
+  // Freeze the conductivity of all initially warm rows before any diffusion.
+  for (let y = 0; y < H_; y++) if (thermalRows[y]) conductivityRow(y, false);
+  for (let y = 0; y < H_; y++) {
+    const row = y * W_, last = y + 1 < H_;
+    if (!thermalRows[y] && (!last || !thermalRows[y + 1])) continue;
+    conductivityRow(y); if (last) conductivityRow(y + 1);
+    for (let x = 0; x < W_; x++) {
+      const i = row + x, ki = kCond_[i];
+      let Ti = temp_[i];
+      if (x + 1 < W_) {
+        const j = i + 1, kj = kCond_[j], d = (Ti - temp_[j]) * (ki < kj ? ki : kj) * 0.25;
+        Ti -= d; temp_[j] += d;
       }
       if (last) {
-        const j = i + W, kj = kCond[j], d = (Ti - temp[j]) * (ki < kj ? ki : kj) * 0.25;
-        Ti -= d; temp[j] += d;
+        const j = i + W_, kj = kCond_[j], d = (Ti - temp_[j]) * (ki < kj ? ki : kj) * 0.25;
+        Ti -= d; temp_[j] += d;
+        if (temp_[j] !== AMBIENT) thermalRows[y + 1] = 1;
       }
-      temp[i] = Ti + (AMBIENT - Ti) * (type[i] === 0 && lOcc[i] === 0 ? 0.004 : 0.0006);
+      temp_[i] = Ti + (AMBIENT - Ti) * (type_[i] === 0 && lOcc_[i] === 0 ? 0.004 : 0.0006);
     }
   }
 }
@@ -2835,32 +2900,35 @@ function blur4(a0, a1, a2, a3) {
 }
 const LQC = [45, 120, 230, 0, 70, 46, 16, 0, 120, 235, 45, 0.5, 0, 0, 0, 0, 214, 138, 26, 0, 170, 176, 190, 0, 196, 214, 120, 0];
 function splatLiquids() {
+  const W_ = W, H_ = H;
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const px_ = px, py_ = py, pk_ = pk, pt_ = pt, pvx_ = pvx, pvy_ = pvy, fW_ = fW, fR_ = fR, fG_ = fG, fBl_ = fBl, fE_ = fE, fS_ = fS, LQC_ = LQC, type_ = type, KIND_ = KIND;
   // spread each particle over the 4 nearest pixels, then blur: a smooth liquid body instead of dots
   if (lqY1 >= lqY0) {
-    const a = lqY0 * W, b = (lqY1 + 1) * W;
-    fW.fill(0, a, b); fR.fill(0, a, b); fG.fill(0, a, b); fBl.fill(0, a, b); fE.fill(0, a, b); fS.fill(0, a, b);
+    const a = lqY0 * W_, b = (lqY1 + 1) * W_;
+    fW_.fill(0, a, b); fR_.fill(0, a, b); fG_.fill(0, a, b); fBl_.fill(0, a, b); fE_.fill(0, a, b); fS_.fill(0, a, b);
   }
-  let y0 = H, y1 = -1, anyE = false, anyS = false;
+  let y0 = H_, y1 = -1, anyE = false, anyS = false;
   for (let k = 0; k < np; k++) {
-    const x = px[k] - 0.5, y = py[k] - 0.5, x0 = Math.floor(x), yy = Math.floor(y), ax = x - x0, ay = y - yy;
-    const p = pk[k];
+    const x = px_[k] - 0.5, y = py_[k] - 0.5, x0 = Math.floor(x), yy = Math.floor(y), ax = x - x0, ay = y - yy;
+    const p = pk_[k];
     let c0, c1, c2, c3;
-    if (p !== 3) { c0 = LQC[p * 4]; c1 = LQC[p * 4 + 1]; c2 = LQC[p * 4 + 2]; c3 = LQC[p * 4 + 3]; }
-    else { const f = Math.max(0, Math.min(1, (pt[k] - 650) / 700)); c0 = 140 + f * 115; c1 = 25 + f * 175; c2 = f * f * 80; c3 = f; }
-    const sp = p === 0 ? Math.sqrt(pvx[k] * pvx[k] + pvy[k] * pvy[k]) : 0;
+    if (p !== 3) { c0 = LQC_[p * 4]; c1 = LQC_[p * 4 + 1]; c2 = LQC_[p * 4 + 2]; c3 = LQC_[p * 4 + 3]; }
+    else { const f = Math.max(0, Math.min(1, (pt_[k] - 650) / 700)); c0 = 140 + f * 115; c1 = 25 + f * 175; c2 = f * f * 80; c3 = f; }
+    const sp = p === 0 ? Math.sqrt(pvx_[k] * pvx_[k] + pvy_[k] * pvy_[k]) : 0;
     if (c3 > 0) anyE = true; if (sp > 0) anyS = true;
     if (yy < y0) y0 = yy; if (yy + 1 > y1) y1 = yy + 1;
     for (let q = 0; q < 4; q++) {
       const cx = x0 + (q & 1), cy = yy + (q >> 1);
-      if (cx < 0 || cx >= W || cy < 0 || cy >= H) continue;
-      const w = ((q & 1) ? ax : 1 - ax) * ((q >> 1) ? ay : 1 - ay), i = cy * W + cx;
-      fW[i] += w; fR[i] += w * c0; fG[i] += w * c1; fBl[i] += w * c2; fE[i] += w * c3; fS[i] += w * sp;
+      if (cx < 0 || cx >= W_ || cy < 0 || cy >= H_) continue;
+      const w = ((q & 1) ? ax : 1 - ax) * ((q >> 1) ? ay : 1 - ay), i = cy * W_ + cx;
+      fW_[i] += w; fR_[i] += w * c0; fG_[i] += w * c1; fBl_[i] += w * c2; fE_[i] += w * c3; fS_[i] += w * sp;
     }
   }
-  lqY0 = Math.max(0, y0 - 2); lqY1 = Math.min(H - 1, y1 + 2);
+  lqY0 = Math.max(0, y0 - 2); lqY1 = Math.min(H_ - 1, y1 + 2);
   if (lqY1 < lqY0) return;
-  for (let i = lqY0 * W, e = (lqY1 + 1) * W; i < e; i++) if (type[i] !== 0 && KIND[type[i]] !== 4) { fW[i] = 0; fR[i] = 0; fG[i] = 0; fBl[i] = 0; fE[i] = 0; fS[i] = 0; }  // no bleeding through walls
-  blur4(fW, fR, fG, fBl); if (anyE) blur(fE); if (anyS) blur(fS);
+  for (let i = lqY0 * W_, e = (lqY1 + 1) * W_; i < e; i++) if (type_[i] !== 0 && KIND_[type_[i]] !== 4) { fW_[i] = 0; fR_[i] = 0; fG_[i] = 0; fBl_[i] = 0; fE_[i] = 0; fS_[i] = 0; }  // no bleeding through walls
+  blur4(fW_, fR_, fG_, fBl_); if (anyE) blur(fE_); if (anyS) blur(fS_);
 }
 
 // ---- procedural noise (only used to bake textures once at start-up) ----
@@ -3071,6 +3139,14 @@ const lM = new Float32Array(N), lA = new Float32Array(N);       // how a pixel t
 const sD = new Uint8Array(N);                                    // depth below the exposed top of a solid / powder column
 const sup = new Uint8Array(N);
 const colD = new Int32Array(W), colS = new Int32Array(W), rowLiq = new Uint8Array(H);
+// Shade only spans containing material, gas or shadows. The unchanged background is copied in bulk.
+const drawX0 = new Int32Array(H), drawX1 = new Int32Array(H);
+const spanX0 = new Int32Array(H), spanX1 = new Int32Array(H);
+const backdrop = new Uint32Array(N);
+for (let i = 0; i < N; i++) {
+  const v = vig[i], r = bgR[i] * v, g = bgG[i] * v, b = bgB[i] * v;
+  backdrop[i] = 0xff000000 | (TONE[b | 0] << 16) | (TONE[g | 0] << 8) | TONE[r | 0];
+}
 const occ = new Float32Array(N), occB = new Float32Array(N);    // occupancy, blurred: ambient occlusion + drop shadows
 const gW = new Float32Array(N), gR = new Float32Array(N), gG = new Float32Array(N), gB = new Float32Array(N);
 let grainsAny = false;
@@ -3228,78 +3304,93 @@ function render() {
   renderMs += (performance.now() - t0 - renderMs) * 0.1;
 }
 function scanColumns() {
-  // column scan: depth below the liquid surface (dA) and below the exposed top of solids / powders (sD)
-  // (sD 255 marks a powder grain that is falling / sliding: it is not part of a pile and gets no pile shading)
+  const gM_ = gM, gV_ = gV, gS_ = gS, gK_ = gK, gH_ = gH, gF_ = gF, temp_ = temp, spanX0_ = spanX0, spanX1_ = spanX1, drawX0_ = drawX0, drawX1_ = drawX1, W_ = W, H_ = H;
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const type_ = type, colS_ = colS, sup_ = sup, lOcc_ = lOcc, KIND_ = KIND, colD_ = colD, sD_ = sD, fW_ = fW, dA_ = dA, occ_ = occ, rowLiq_ = rowLiq, dB_ = dB;
+  // column scan: depth below the liquid surface (dA_) and below the exposed top of solids / powders (sD_)
+  // (sD_ 255 marks a powder grain that is falling / sliding: it is not part of a pile and gets no pile shading)
   // bottom-up: a powder grain only belongs to a pile if it rests on something (falling clumps get no pile shading)
-  colS.fill(1);
-  for (let y = H - 1; y >= 0; y--) {
-    const r = y * W;
-    for (let x = 0; x < W; x++) {
-      const i = r + x, t = type[i];
-      if (t === 0) { colS[x] = lOcc[i] ? 1 : 0; sup[i] = 0; }
-      else if (KIND[t] !== 2) { colS[x] = 1; sup[i] = 1; }
-      else { sup[i] = 1; colS[x] = 1; }   // grains in the grid are lying on the pile (falling ones fly as particles and are drawn separately)
-    }
-  }
-  colD.fill(0); colS.fill(0);
-  for (let y = 0, i = 0; y < H; y++) {
+  spanX0_.fill(W_); spanX1_.fill(-1);
+  colD_.fill(0); colS_.fill(0);
+  for (let y = 0, i = 0; y < H_; y++) {
     const liqRow = y >= lqY0 && y <= lqY1;
     let any = false;
-    for (let x = 0; x < W; x++, i++) {
-      const t = type[i];
+    for (let x = 0; x < W_; x++, i++) {
+      const t = type_[i];
+      sup_[i] = t ? 1 : 0;
+      if (t || fW_[i] > L_THR - 0.14 || gM_[i] > 0.002 || gV_[i] > 0.002 || gS_[i] > 0.002 ||
+          gK_[i] > 0.01 || gH_[i] > 0.01 || gF_[i] * 1.3 + Math.max(0, temp_[i] - 800) / 5000 > 0.01) {
+        if (x < spanX0_[y]) spanX0_[y] = x;
+        spanX1_[y] = x;
+      }
       if (t === 0) {
-        colS[x] = 0; sD[i] = 0;
-        if (liqRow && fW[i] >= L_THR) { dA[i] = colD[x]++; occ[i] = 0.45; any = true; } else { dA[i] = -1; colD[x] = 0; occ[i] = 0; }
+        colS_[x] = 0; sD_[i] = 0;
+        if (liqRow && fW_[i] >= L_THR) { dA_[i] = colD_[x]++; occ_[i] = 0.45; any = true; } else { dA_[i] = -1; colD_[x] = 0; occ_[i] = 0; }
       } else {
-        dA[i] = -1; colD[x] = 0; occ[i] = 1;
-        if (KIND[t] === 2 && !sup[i]) { sD[i] = 255; colS[x] = 0; }
-        else { const s = colS[x]; sD[i] = s < 254 ? s : 254; colS[x] = s + 1; }
+        dA_[i] = -1; colD_[x] = 0; occ_[i] = 1;
+        if (KIND_[t] === 2 && !sup_[i]) { sD_[i] = 255; colS_[x] = 0; }
+        else { const s = colS_[x]; sD_[i] = s < 254 ? s : 254; colS_[x] = s + 1; }
       }
     }
-    rowLiq[y] = any ? 1 : 0;
+    rowLiq_[y] = any ? 1 : 0;
   }
   // depth below the surface, smoothed sideways so the shading has no vertical streaks
-  for (let y = 0; y < H; y++) {
-    if (!rowLiq[y]) continue;
-    const r = y * W;
+  for (let y = 0; y < H_; y++) {
+    if (!rowLiq_[y]) continue;
+    const r = y * W_;
     let s = 0, c = 0;
-    for (let o = 0; o <= 4; o++) { const v = dA[r + o]; if (v >= 0) { s += v; c++; } }
-    for (let x = 0; x < W; x++) {
+    for (let o = 0; o <= 4; o++) { const v = dA_[r + o]; if (v >= 0) { s += v; c++; } }
+    for (let x = 0; x < W_; x++) {
       const i = r + x;
-      dB[i] = dA[i] < 0 ? -1 : s / c;
+      dB_[i] = dA_[i] < 0 ? -1 : s / c;
       const xa = x + 5, xr = x - 4;
-      if (xa < W) { const v = dA[r + xa]; if (v >= 0) { s += v; c++; } }
-      if (xr >= 0) { const v = dA[r + xr]; if (v >= 0) { s -= v; c--; } }
+      if (xa < W_) { const v = dA_[r + xa]; if (v >= 0) { s += v; c++; } }
+      if (xr >= 0) { const v = dA_[r + xr]; if (v >= 0) { s -= v; c--; } }
     }
   }
+  drawX0_.fill(W_); drawX1_.fill(-1);
+  for (let y = 0; y < H_; y++) {
+    if (spanX1_[y] < 0) continue;
+    // The 2px AO blur and its (2,3) shadow offset reach at most five rows away.
+    const a = Math.max(0, spanX0_[y] - 2), b = Math.min(W_ - 1, spanX1_[y] + 4);
+    for (let yy = Math.max(0, y - 2), e = Math.min(H_ - 1, y + 5); yy <= e; yy++) {
+      if (a < drawX0_[yy]) drawX0_[yy] = a;
+      if (b > drawX1_[yy]) drawX1_[yy] = b;
+    }
+  }
+
 }
 function shade() {
+  const drawX0_ = drawX0, drawX1_ = drawX1, W_ = W, H_ = H;
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const type_ = type, texU_ = texU, texV_ = texV, dA_ = dA, fW_ = fW, fE_ = fE, fR_ = fR, fG_ = fG, fBl_ = fBl, dB_ = dB, fS_ = fS, lvA_ = lvA, lvB_ = lvB, occB_ = occB, bgR_ = bgR, bgG_ = bgG, bgB_ = bgB, gM_ = gM, gV_ = gV, gS_ = gS, gK_ = gK, gH_ = gH, temp_ = temp, gF_ = gF, FLUT_ = FLUT, PLUT_ = PLUT, nz_ = nz, sD_ = sD, life_ = life, IGN_ = IGN, TEX_ = TEX, grp_ = grp, rbOwner_ = rbOwner, hv_ = hv, dmg_ = dmg, soot_ = soot, oR_ = oR, oG_ = oG, oB_ = oB, lM_ = lM, lA_ = lA, eR_ = eR, eG_ = eG, eB_ = eB, KIND_ = KIND;
   // every pixel's own colour (material, texture, edge light, gases, flames) + its light emission
-  eR.fill(0); eG.fill(0); eB.fill(0);
+  eR_.fill(0); eG_.fill(0); eB_.fill(0);
+  oR_.set(bgR_); oG_.set(bgG_); oB_.set(bgB_); lM_.fill(0); lA_.fill(0.1);
   let emSum = 0, lastId = 0, lastB = null;
   const lvf = 0.5 + 0.5 * Math.sin(frame * 0.012);
   const fr = frame, CU = ID.COPPER, GL = ID.GLASS, IC = ID.ICE, MT = ID.METAL, HT = ID.HEATER, CL = ID.COOLER, SN = ID.SNOW, shOn = lightEff ? 1 : 0;
-  for (let y = 0, i = 0; y < H; y++) {
+  for (let y = 0; y < H_; y++) {
     const lrow = (y >> 2) * LW;
-    for (let x = 0; x < W; x++, i++) {
-      const t = type[i];
+    for (let x = drawX0_[y], i = y * W_ + x, end = drawX1_[y]; x <= end; x++, i++) {
+      const t = type_[i];
       let r, g, b, er = 0, eg = 0, eb = 0, m, a;
       if (t === 0) {
-        texU[i] = x; texV[i] = y;
-        if (dA[i] >= 0) {
+        texU_[i] = x; texV_[i] = y;
+        if (dA_[i] >= 0) {
           // liquid body: lighter at the surface, darker with depth (unless glowing), foam where water moves fast
-          const w = fW[i], em = Math.min(1, fE[i] / w);
-          r = fR[i] / w; g = fG[i] / w; b = fBl[i] / w;
-          const depth = dA[i], f = Math.min(1, dB[i] / 45) * (1 - em);
+          const w = fW_[i], em = Math.min(1, fE_[i] / w);
+          r = fR_[i] / w; g = fG_[i] / w; b = fBl_[i] / w;
+          const depth = dA_[i], f = Math.min(1, dB_[i] / 45) * (1 - em);
           r *= 1 - 0.6 * f; g *= 1 - 0.55 * f; b *= 1 - 0.4 * f;
           const sh = Math.sin(x * 0.21 + y * 0.13 + fr * 0.06) * 5 * (1 - f);
           r += sh * 0.5; g += sh; b += sh;
           if (depth === 0) { r += (255 - r) * 0.45; g += (255 - g) * 0.45; b += (255 - b) * 0.45; }
           else if (depth === 1) { r += (255 - r) * 0.12; g += (255 - g) * 0.12; b += (255 - b) * 0.12; }
-          const spd = fS[i] / Math.max(w, 0.05);
+          const spd = fS_[i] / Math.max(w, 0.05);
           if (spd > 1.2) { const al = Math.min(0.7, (spd - 1.2) * 0.5); r += (225 - r) * al; g += (240 - g) * al; b += (255 - b) * al; }
           if (em > 0.05 && r > g) {                        // lava: dark cooling crust drifting over the glowing melt
-            const n = lvA[i] * lvf + lvB[i] * (1 - lvf), c = n < 0.47 ? Math.min(1, (0.47 - n) * 6) * (1.15 - em) : 0;
+            const n = lvA_[i] * lvf + lvB_[i] * (1 - lvf), c = n < 0.47 ? Math.min(1, (0.47 - n) * 6) * (1.15 - em) : 0;
             if (c > 0) { r += (70 - r) * c; g += (22 - g) * c; b += (12 - b) * c; }
             else if (n > 0.62) { const h = Math.min(1, (n - 0.62) * 5) * em; g += (240 - g) * h * 0.5; b += 60 * h; }
           }
@@ -3307,18 +3398,18 @@ function shade() {
           m = 1.1 * (1 - em); a = 0.1 * (1 - em);
         } else {
           // backdrop, darkened by ambient occlusion and a soft drop shadow of whatever is up-left of it
-          const sh = shOn ? (y >= 3 && x >= 2 ? occB[i - 3 * W - 2] : 0) * 0.5 + occB[i] * 0.35 : 0, k = 1 - (sh > 0.78 ? 0.78 : sh);
-          r = bgR[i] * k; g = bgG[i] * k; b = bgB[i] * k;
-          const w = fW[i];
+          const sh = shOn ? (y >= 3 && x >= 2 ? occB_[i - 3 * W_ - 2] : 0) * 0.5 + occB_[i] * 0.35 : 0, k = 1 - (sh > 0.78 ? 0.78 : sh);
+          r = bgR_[i] * k; g = bgG_[i] * k; b = bgB_[i] * k;
+          const w = fW_[i];
           if (w > L_THR - 0.14) {                       // soft anti-aliased liquid edge
             const al = (w - (L_THR - 0.14)) / 0.14 * 0.7;
-            r += (fR[i] / w - r) * al; g += (fG[i] / w - g) * al; b += (fBl[i] / w - b) * al;
+            r += (fR_[i] / w - r) * al; g += (fG_[i] / w - g) * al; b += (fBl_[i] / w - b) * al;
           }
           // gases: methane faint green, steam soft white, smoke grey (thicker = darker, absorbs light)
-          const me = gM[i], st = gV[i], sm = gS[i];
+          const me = gM_[i], st = gV_[i], sm = gS_[i];
           a = 0.1;
           if (me > 0.002) { const al = Math.min(0.35, me * 0.3); r += (110 - r) * al; g += (190 - g) * al; b += (150 - b) * al; a += al * 0.3; }
-          const ck = gK[i], hy = gH[i];
+          const ck = gK_[i], hy = gH_[i];
           if (ck > 0.01) { const al = Math.min(0.22, ck * 0.18); r += (150 - r) * al; g += (160 - g) * al; b += (172 - b) * al; }   // CO2: a faint heavy haze
           if (hy > 0.01) { const al = Math.min(0.12, hy * 0.1); r += (190 - r) * al; g += (210 - g) * al; b += (255 - b) * al; }   // hydrogen: barely visible shimmer
           if (st > 0.002) { const al = (1 - Math.exp(-st * 2.6)) * 0.88; r += (212 - r) * al; g += (220 - g) * al; b += (232 - b) * al; a += al * 0.9; }
@@ -3327,22 +3418,22 @@ function shade() {
             r += (c - r) * al; g += (c - 2 - g) * al; b += (c - 1 - b) * al; a += al * 0.55;
           }
           // flame and glowing hot air: colour runs dark red -> orange -> yellow -> white with heat
-          const T = temp[i], fl = gF[i];
+          const T = temp_[i], fl = gF_[i];
           const hot = fl * 1.3 + (T > 800 ? (T - 800) / 5000 : 0);   // hot burnt gas barely glows; the flame sheet does
           if (hot > 0.01) {
             const al = 1 - Math.exp(-hot * 1.7);
             let h = 0.2 + fl * 0.45 + (T > 700 ? (T - 700) / 6000 : 0); if (h > 0.88) h = 0.88;
-            const q = ((h * 255) | 0) * 3, fr0 = FLUT[q] * al, fg0 = FLUT[q + 1] * al, fb0 = FLUT[q + 2] * al;
+            const q = ((h * 255) | 0) * 3, fr0 = FLUT_[q] * al, fg0 = FLUT_[q + 1] * al, fb0 = FLUT_[q + 2] * al;
             r += fr0; g += fg0; b += fb0; er = fr0 * 0.9; eg = fg0 * 0.9; eb = fb0 * 0.9;
           }
           m = 0;
         }
-      } else if (KIND[t] === 2) {
-        texU[i] = x; texV[i] = y;
-        const L = PLUT[t], n = nz[i];
+      } else if (KIND_[t] === 2) {
+        texU_[i] = x; texV_[i] = y;
+        const L = PLUT_[t], n = nz_[i];
         if (L) { const c = L[n & 255]; r = c & 255; g = (c >>> 8) & 255; b = (c >>> 16) & 255; }
         else { const c = DEFS[t].c; r = c[0] + n; g = c[1] + n; b = c[2] + n; }
-        const d = sD[i], up = y > 0 ? type[i - W] : 1, dn = y < H - 1 ? type[i + W] : 1;
+        const d = sD_[i], up = y > 0 ? type_[i - W_] : 1, dn = y < H_ - 1 ? type_[i + W_] : 1;
         let sh = 1;
         if (d !== 255) {
           sh -= 0.3 * (d < 18 ? d : 18) / 18;
@@ -3351,28 +3442,28 @@ function shade() {
         }
         if (t === SN) { r *= sh * sh; g *= sh * (0.4 + sh * 0.6); b *= 0.25 + sh * 0.75; }
         else { r *= sh; g *= sh; b *= sh; }
-        if (life[i] > 0 && IGN[t] < 1e9) {               // burning powder: charring grains with glowing embers
+        if (life_[i] > 0 && IGN_[t] < 1e9) {               // burning powder: charring grains with glowing embers
           r += (30 - r) * 0.6; g += (22 - g) * 0.6; b += (18 - b) * 0.6;
           const e = (0.55 + 0.45 * Math.sin(fr * 0.2 + n * 1.7)) * ((n & 3) === 0 ? 1 : 0.45);
           r += 255 * e; g += 110 * e * e; b += 25 * e * e * e; er = 220 * e; eg = 90 * e * e; eb = 20 * e * e;
         }
-        const T = temp[i];
+        const T = temp_[i];
         if (T > 450) { const f = Math.min(1, (T - 450) / 700); r += f * 200; g += f * f * 130; b += f * f * f * 60; er += f * 170; eg += f * f * 100; eb += f * f * f * 40; }
-        if (fW[i] > 0.5) { r *= 0.74; g *= 0.77; b *= 0.86; }   // soaked look
+        if (fW_[i] > 0.5) { r *= 0.74; g *= 0.77; b *= 0.86; }   // soaked look
         m = 1.3; a = 0.06;
-        if (d === 255 && y > 1 && type[i - W] === 0) {     // falling grain: soft trail above it, so streams read as streams
-          const j = i - W, j2 = j - W, w2 = type[j2] === 0 ? 0.14 : 0;
+        if (d === 255 && y > 1 && type_[i - W_] === 0) {     // falling grain: soft trail above it, so streams read as streams
+          const j = i - W_, j2 = j - W_, w2 = type_[j2] === 0 ? 0.14 : 0;
           gW[j] += 0.32; gR[j] += 0.32 * r; gG[j] += 0.32 * g; gB[j] += 0.32 * b;
           gW[j2] += w2; gR[j2] += w2 * r; gG[j2] += w2 * g; gB[j2] += w2 * b;
           grainsAny = true;
         }
       } else {
         // ---- solids: baked texture + edge lighting (lit top/left rims, dark undersides, deeper = darker) ----
-        const tx = TEX[t];
+        const tx = TEX_[t];
         let mk = 0;
         if (tx) {
-          let u = texU[i], v = texV[i];
-          const ow = rbOwner[i];
+          let u = texU_[i], v = texV_[i];
+          const ow = rbOwner_[i];
           if (ow) {
             if (ow !== lastId) { lastId = ow; lastB = bodyTex.get(ow) || null; }
             if (lastB) {
@@ -3381,9 +3472,9 @@ function shade() {
               if (q >= 0 && j >= 0 && q < rb.mw && j < rb.mh) { const k = j * rb.mw + q; u = lastB.tu[k]; v = lastB.tv[k]; }
             }
           }
-          const c = tx[v * W + u]; r = c & 255; g = (c >>> 8) & 255; b = (c >>> 16) & 255; mk = c >>> 24;
-        } else { const c = DEFS[t].c, n = nz[i]; r = c[0] + n; g = c[1] + n; b = c[2] + n; }
-        const d = sD[i], up = y > 0 ? type[i - W] : 1, dn = y < H - 1 ? type[i + W] : 1, lf = x > 0 ? type[i - 1] : 1, rt = x < W - 1 ? type[i + 1] : 1;
+          const c = tx[v * W_ + u]; r = c & 255; g = (c >>> 8) & 255; b = (c >>> 16) & 255; mk = c >>> 24;
+        } else { const c = DEFS[t].c, n = nz_[i]; r = c[0] + n; g = c[1] + n; b = c[2] + n; }
+        const d = sD_[i], up = y > 0 ? type_[i - W_] : 1, dn = y < H_ - 1 ? type_[i + W_] : 1, lf = x > 0 ? type_[i - 1] : 1, rt = x < W_ - 1 ? type_[i + 1] : 1;
         let sh = 1 - 0.2 * (d < 14 ? d : 14) / 14;
         if (up === 0) sh += t === MT ? 0.42 : 0.2; else if (d === 1) sh += t === MT ? 0.12 : 0.06;
         if (lf === 0) sh += 0.07;
@@ -3391,26 +3482,26 @@ function shade() {
         if (dn === 0) sh -= 0.2;
         if (t === GL || t === IC) {
           // translucent: the backdrop shows through, tinted; bright rims and diagonal glints
-          const s2 = shOn ? occB[i] * 0.25 : 0, al = t === GL ? 0.34 : 0.74;
-          const br = bgR[i] * (1 - s2), bgc = bgG[i] * (1 - s2), bb = bgB[i] * (1 - s2);
+          const s2 = shOn ? occB_[i] * 0.25 : 0, al = t === GL ? 0.34 : 0.74;
+          const br = bgR_[i] * (1 - s2), bgc = bgG_[i] * (1 - s2), bb = bgB_[i] * (1 - s2);
           r = br + (r * sh - br) * al; g = bgc + (g * sh - bgc) * al; b = bb + (b * sh - bb) * al;
           const rim = (up === 0 ? 0.55 : 0) + (lf === 0 ? 0.35 : 0) + (rt === 0 ? 0.2 : 0) + (dn === 0 ? 0.15 : 0);
           const gl = mk * (1 / 255) * 0.5 + (rim > 0.6 ? 0.6 : rim);
           r += (235 - r) * gl; g += (250 - g) * gl; b += (255 - b) * gl;
           m = 0.7; a = 0.14;
         } else { r *= sh; g *= sh; b *= sh; m = 1.3; a = 0.06; }
-        if (life[i] > 0 && IGN[t] < 1e9) {                // burning: wood blackens to charcoal, glowing cracks pulse
-          const n = nz[i], ch = KIND[t] === 1 ? Math.min(1, hv[i] / 60) : 0.7;
+        if (life_[i] > 0 && IGN_[t] < 1e9) {                // burning: wood blackens to charcoal, glowing cracks pulse
+          const n = nz_[i], ch = KIND_[t] === 1 ? Math.min(1, hv_[i] / 60) : 0.7;
           r += (26 - r) * ch; g += (19 - g) * ch; b += (15 - b) * ch;
           const crack = (n & 3) === 0 ? 1 : (n & 3) === 1 ? 0.55 : 0.2;
           const e = (0.55 + 0.45 * Math.sin(fr * 0.18 + n * 1.3 + x * 0.4)) * crack * (exposedAt(x, y) ? 1 : 0.35) * (0.4 + 0.6 * ch);
           r += 255 * e; g += 95 * e * e; b += 20 * e * e * e;
           er = 230 * e; eg = 80 * e * e; eb = 15 * e * e;
-        } else if (hv[i] > 0 && IGN[t] < 1e9) {            // put-out fuel stays charred
-          const ch = Math.min(1, hv[i] / 60);
+        } else if (hv_[i] > 0 && IGN_[t] < 1e9) {            // put-out fuel stays charred
+          const ch = Math.min(1, hv_[i] / 60);
           r += (26 - r) * ch; g += (19 - g) * ch; b += (15 - b) * ch;
         }
-        const T = temp[i];
+        const T = temp_[i];
         if (t === HT) {                                     // heater: coils glow and breathe slowly
           const e = (mk ? 1 : 0.18) * (0.78 + 0.22 * Math.sin(fr * 0.04 + x * 0.09)) * Math.max(0.2, Math.min(1, (T - 100) / 600));
           r += 230 * e; g += 90 * e * e; b += 20 * e * e; er = 150 * e; eg = 50 * e; eb = 14 * e;
@@ -3419,59 +3510,64 @@ function shade() {
           r += f * 200; g += f * f * 130; b += f * f * f * 60; er += f * 190; eg += f * f * 110; eb += f * f * f * 45;
         }
         if (t === CL) { er = 6; eg = 22; eb = 60; }        // cooler: faint cold-blue light
-        if (fW[i] > 0.5) { r *= 0.78; g *= 0.8; b *= 0.9; }   // soaked look
-        const dm = dmg[i];
+        if (fW_[i] > 0.5) { r *= 0.78; g *= 0.8; b *= 0.9; }   // soaked look
+        const dm = dmg_[i];
         if (dm > 40) {                                      // cracks: dark fissure pixels appear as damage gets serious
           let h = Math.imul(x, 374761393) ^ Math.imul(y, 668265263); h = Math.imul(h ^ (h >>> 13), 1274126177); h = ((h ^ (h >>> 16)) >>> 0) & 255;
           const k = h < (dm - 40) * 0.55 ? 0.42 : 1 - dm * 0.0004;
           r *= k; g *= k; b *= k;
         }
-        if ((lf === t && grp[i - 1] !== grp[i]) || (up === t && grp[i - W] !== grp[i])) { r *= 0.5; g *= 0.5; b *= 0.5; }   // seam between separate pieces
-        if (t === CU && hv[i] > 0) {                        // copper patina: blue-green, patchy
-          const pa = Math.min(1, hv[i] / 90) * (0.7 + 0.3 * Math.sin(x * 1.3 + y * 1.9 + nz[i]));
+        if ((lf === t && grp_[i - 1] !== grp_[i]) || (up === t && grp_[i - W_] !== grp_[i])) { r *= 0.5; g *= 0.5; b *= 0.5; }   // seam between separate pieces
+        if (t === CU && hv_[i] > 0) {                        // copper patina: blue-green, patchy
+          const pa = Math.min(1, hv_[i] / 90) * (0.7 + 0.3 * Math.sin(x * 1.3 + y * 1.9 + nz_[i]));
           r += (78 - r) * pa; g += (150 - g) * pa; b += (122 - b) * pa;
         }
-        if (t === MT && hv[i] > 0) {                        // rust: patchy orange-brown, rougher where it is deeper
-          const ru = Math.min(1, hv[i] / 90) * (0.75 + 0.25 * Math.sin(x * 1.7 + y * 2.3 + nz[i]));
+        if (t === MT && hv_[i] > 0) {                        // rust: patchy orange-brown, rougher where it is deeper
+          const ru = Math.min(1, hv_[i] / 90) * (0.75 + 0.25 * Math.sin(x * 1.7 + y * 2.3 + nz_[i]));
           r += (128 - r) * ru; g += (62 - g) * ru; b += (32 - b) * ru;
         }
-        if (soot[i]) { const k = 1 - soot[i] / 255 * 0.8; r *= k; g *= k; b *= k * 0.95; }
+        if (soot_[i]) { const k = 1 - soot_[i] / 255 * 0.8; r *= k; g *= k; b *= k * 0.95; }
       }
-      oR[i] = r; oG[i] = g; oB[i] = b; lM[i] = m; lA[i] = a;
-      if (er + eg + eb > 0.5) { const q = lrow + (x >> 2); eR[q] += er; eG[q] += eg; eB[q] += eb; emSum += er + eg + eb; }
+      oR_[i] = r; oG_[i] = g; oB_[i] = b; lM_[i] = m; lA_[i] = a;
+      if (er + eg + eb > 0.5) { const q = lrow + (x >> 2); eR_[q] += er; eG_[q] += eg; eB_[q] += eb; emSum += er + eg + eb; }
     }
   }
   return emSum;
 }
 function compose() {
+  const drawX0_ = drawX0, drawX1_ = drawX1, backdrop_ = backdrop, W_ = W, H_ = H;
+  // Local buffer references keep the inner loops out of the shared script scope.
+  const oR_ = oR, oG_ = oG, oB_ = oB, gW_ = gW, gR_ = gR, gG_ = gG, gB_ = gB, lM_ = lM, lA_ = lA, lrR_ = lrR, lrG_ = lrG, lrB_ = lrB, cR_ = cR, cG_ = cG, cB_ = cB, uy0_ = uy0, uy1_ = uy1, uay_ = uay, ux0_ = ux0, ux1_ = ux1, uax_ = uax, vig_ = vig, pix_ = pix, TONE_ = TONE;
   // composite: flying grains over everything, then light (reflected on surfaces, scattered in haze/smoke), tone, vignette
   const lit = lightLive, ga = grainsAny, inv255 = 1 / 255;
-  for (let y = 0, i = 0; y < H; y++) {
+  const sparse = !lit && !ga;
+  if (sparse) pix_.set(backdrop_);
+  for (let y = 0; y < H_; y++) {
     if (lit) {
-      const r0 = uy0[y] * LW, r1 = uy1[y] * LW, ay = uay[y], by = 1 - ay;
-      for (let q = 0; q < LW; q++) { lrR[q] = cR[r0 + q] * by + cR[r1 + q] * ay; lrG[q] = cG[r0 + q] * by + cG[r1 + q] * ay; lrB[q] = cB[r0 + q] * by + cB[r1 + q] * ay; }
+      const r0 = uy0_[y] * LW, r1 = uy1_[y] * LW, ay = uay_[y], by = 1 - ay;
+      for (let q = 0; q < LW; q++) { lrR_[q] = cR_[r0 + q] * by + cR_[r1 + q] * ay; lrG_[q] = cG_[r0 + q] * by + cG_[r1 + q] * ay; lrB_[q] = cB_[r0 + q] * by + cB_[r1 + q] * ay; }
     }
-    for (let x = 0; x < W; x++, i++) {
-      let r = oR[i], g = oG[i], b = oB[i];
+    for (let x = sparse ? drawX0_[y] : 0, i = y * W_ + x, end = sparse ? drawX1_[y] : W_ - 1; x <= end; x++, i++) {
+      let r = oR_[i], g = oG_[i], b = oB_[i];
       if (ga) {
-        const w = gW[i];
+        const w = gW_[i];
         if (w > 0.004) {
           const al = w * 1.7 > 1 ? 1 : w * 1.7, iw = 1 / w;
-          r += (gR[i] * iw - r) * al; g += (gG[i] * iw - g) * al; b += (gB[i] * iw - b) * al;
-          lM[i] += (1.3 - lM[i]) * al; lA[i] += (0.06 - lA[i]) * al;
+          r += (gR_[i] * iw - r) * al; g += (gG_[i] * iw - g) * al; b += (gB_[i] * iw - b) * al;
+          lM_[i] += (1.3 - lM_[i]) * al; lA_[i] += (0.06 - lA_[i]) * al;
         }
       }
       if (lit) {
-        const a0 = ux0[x], a1 = ux1[x], ax = uax[x];
-        const Lr = lrR[a0] + (lrR[a1] - lrR[a0]) * ax, Lg = lrG[a0] + (lrG[a1] - lrG[a0]) * ax, Lb = lrB[a0] + (lrB[a1] - lrB[a0]) * ax;
+        const a0 = ux0_[x], a1 = ux1_[x], ax = uax_[x];
+        const Lr = lrR_[a0] + (lrR_[a1] - lrR_[a0]) * ax, Lg = lrG_[a0] + (lrG_[a1] - lrG_[a0]) * ax, Lb = lrB_[a0] + (lrB_[a1] - lrB_[a0]) * ax;
         if (Lr + Lg + Lb > 0.3) {
-          const m = lM[i] * inv255, a = lA[i];
+          const m = lM_[i] * inv255, a = lA_[i];
           r += Lr * (r * m + a); g += Lg * (g * m + a); b += Lb * (b * m + a);
         }
       }
-      const v = vig[i];
+      const v = vig_[i];
       r *= v; g *= v; b *= v;
-      pix[i] = 0xff000000 | (TONE[b < 0 ? 0 : b > 1023 ? 1023 : b | 0] << 16) | (TONE[g < 0 ? 0 : g > 1023 ? 1023 : g | 0] << 8) | TONE[r < 0 ? 0 : r > 1023 ? 1023 : r | 0];
+      pix_[i] = 0xff000000 | (TONE_[b < 0 ? 0 : b > 1023 ? 1023 : b | 0] << 16) | (TONE_[g < 0 ? 0 : g > 1023 ? 1023 : g | 0] << 8) | TONE_[r < 0 ? 0 : r > 1023 ? 1023 : r | 0];
     }
   }
 }
@@ -3608,11 +3704,37 @@ $('bLight').onclick = () => toggleLight();
 function toggleOrient() {
   if (NET.role === 'guest') return;
   if (NET.role === 'host' && NET.actors.length && !confirm('Changing the canvas shape restarts the page and ends the room. Continue?')) return;
-  try { localStorage.setItem('pr-orient', PORTRAIT ? 'landscape' : 'portrait'); } catch (e) {}
+  try {
+    localStorage.setItem('pr-orient', PORTRAIT ? 'landscape' : 'portrait');
+    if (customSize) localStorage.setItem('pr-canvas', JSON.stringify([H, W]));
+  } catch (e) { showToast('Cannot save canvas', 'Allow site storage to change the canvas.'); return; }
   location.reload();
 }
 $('bOrient').textContent = PORTRAIT ? 'landscape' : 'portrait';
 $('bOrient').onclick = () => toggleOrient();
+// Reuse the existing size control; the menu and its layout stay unchanged.
+function changeCanvasSize() {
+  if (NET.role === 'guest') return;
+  const value = window.prompt('Canvas width x height in pixels (even numbers, 32–2048; up to 1,048,576 pixels).\nChanging size clears the scene. Enter "default" to reset.', W + ' x ' + H);
+  if (value === null) return;
+  const reset = value.trim().toLowerCase() === 'default';
+  const match = /^\s*(\d+)\s*[x×, ]\s*(\d+)\s*$/i.exec(value);
+  const size = match && canvasSize(Number(match[1]), Number(match[2]));
+  if (!reset && !size) { showToast('Invalid canvas size', 'Use even dimensions from 32–2048, up to 1,048,576 pixels.'); return; }
+  if (!reset && size[0] === W && size[1] === H) return;
+  if (NET.role === 'host' && NET.actors.length && !confirm('Changing the canvas size ends the room. Continue?')) return;
+  try {
+    if (reset) localStorage.removeItem('pr-canvas');
+    else {
+      localStorage.setItem('pr-canvas', JSON.stringify(size));
+      localStorage.setItem('pr-orient', size[1] > size[0] ? 'portrait' : 'landscape');
+    }
+  } catch (e) { showToast('Cannot save canvas', 'Allow site storage to change the canvas.'); return; }
+  location.reload();
+}
+$('bSize').textContent = customSize ? W + '×' + H : '2x';
+$('bSize').title = 'Custom canvas size: ' + W + ' × ' + H + '  [Shift+P]';
+$('bSize').onclick = changeCanvasSize;
 let eraseMode = false;
 function setErase(v) { eraseMode = v; $('bErase').classList.toggle('on', eraseMode); $('mErase').classList.toggle('on', eraseMode); $('mDraw').classList.toggle('on', !eraseMode); }
 function toggleErase() { setErase(!eraseMode); }
@@ -3650,7 +3772,15 @@ document.addEventListener('pointerdown', e => {
 });
 $('mStep').onclick = () => { $('mMenu').classList.remove('open'); stepOnce(); };
 $('mOrient').textContent = PORTRAIT ? 'switch canvas to landscape' : 'switch canvas to portrait';
-$('mOrient').onclick = () => toggleOrient();
+let sizeHoldTimer = 0, sizeHeld = false;
+$('mOrient').onclick = () => { if (!sizeHeld) toggleOrient(); sizeHeld = false; };
+$('mOrient').title = 'Hold to set a custom canvas size';
+$('mOrient').addEventListener('pointerdown', () => {
+  sizeHeld = false;
+  sizeHoldTimer = setTimeout(() => { sizeHeld = true; changeCanvasSize(); }, 550);
+});
+for (const event of ['pointerup', 'pointercancel', 'pointerleave']) $('mOrient').addEventListener(event, () => clearTimeout(sizeHoldTimer));
+$('mOrient').addEventListener('contextmenu', e => e.preventDefault());
 $('mDraw').onclick = () => setErase(false);
 $('mErase').onclick = () => setErase(true);
 $('mBm').onclick = () => setBrush(brush - 1);
@@ -3733,7 +3863,6 @@ function paint(x, y, erase) {
   const r = brush;
   // a huge brush used to add well over a thousand particles per frame; thin the pour so the flow stays bounded
   const pourP = Math.min(0.5, spawnBudget / (3.2 * (r * r + 1)));
-  if (!erase && sel !== 0 && KIND[sel] === 3 && np >= PCAP) noteCap();
   if (!erase && isTool(sel)) { toolPaint(x, y); return; }
   if (erase || sel === 0) {
     for (let k = np - 1; k >= 0; k--) {
@@ -3753,7 +3882,7 @@ function paint(x, y, erase) {
     if (erase || sel === 0) { type[i] = 0; temp[i] = AMBIENT; life[i] = 0; gS[i] = 0; gV[i] = 0; gM[i] = 0; gF[i] = 0; gK[i] = 0; gH[i] = 0; }
     else if (KIND[sel] === 4) addGas(i, sel, sel === ID.FIRE ? 0.6 : 0.25);
     else if (KIND[sel] === 3) {
-      if (type[i] === 0 && lOcc[i] === 0 && spawnBudget > 0 && np < PCAP && Math.random() < pourP) { spawnLiquidInCell(sel, i); lOcc[i] = 1; lKind[i] = LQI[sel]; spawnBudget--; }
+      if (type[i] === 0 && lOcc[i] === 0 && spawnBudget > 0 && Math.random() < pourP) { spawnLiquidInCell(sel, i); lOcc[i] = 1; lKind[i] = LQI[sel]; spawnBudget--; }
     }
     else if (free(i) || KIND[sel] === 1 && KIND[type[i]] !== 1) {
       if (KIND[sel] === 2) {
@@ -3803,7 +3932,7 @@ window.addEventListener('keydown', e => {
   else if (k === 't' || k === 'T') toggleHeat();
   else if (k === 'v' || k === 'V') togglePres();
   else if (k === 'l' || k === 'L') toggleLight();
-  else if (k === 'p' || k === 'P') toggleOrient();
+  else if (k === 'p' || k === 'P') { if (e.shiftKey) changeCanvasSize(); else toggleOrient(); }
   else if (k === 'x' || k === 'X') toggleErase();
   else if (k === '.' || k === '>') stepOnce();
   else if (k === '[') setBrush(brush - 1);
@@ -3817,7 +3946,7 @@ function resize() {
   const stage = $('stage'), dpr = window.devicePixelRatio || 1;
   const aw = (stage.clientWidth - 16) * dpr, ah = (stage.clientHeight - 16) * dpr;
   let s = Math.min(aw / W, ah / H);
-  s = s >= 4 ? Math.floor(s) : s >= 1 ? Math.floor(s * 4) / 4 : Math.max(0.25, s);   // whole pixels when big, quarter steps when small
+  s = s >= 4 ? Math.floor(s) : s >= 1 ? Math.floor(s * 4) / 4 : Math.max(0.001, s);   // large custom canvases still fit small screens
   cv.style.width = W * s / dpr + 'px'; cv.style.height = H * s / dpr + 'px';
 }
 window.addEventListener('resize', resize); resize();
@@ -3869,7 +3998,7 @@ function netTag(text, wait) {
   t.textContent = ''; t.appendChild(document.createElement('i')); t.appendChild(document.createTextNode(text));
   t.className = 'show' + (wait ? ' wait' : '');
 }
-function inviteURL() { return location.origin + location.pathname + '?join=' + NET.code + '&o=' + (PORTRAIT ? 'p' : 'l'); }
+function inviteURL() { return location.origin + location.pathname + '?join=' + NET.code + '&o=' + (PORTRAIT ? 'p' : 'l') + '&w=' + W + '&h=' + H; }
 async function keepAwake() { try { if (navigator.wakeLock && !NET.wake) { NET.wake = await navigator.wakeLock.request('screen'); NET.wake.addEventListener('release', () => { NET.wake = null; }); } } catch (e) {} }
 document.addEventListener('visibilitychange', () => { if (!document.hidden && NET.role !== 'solo') keepAwake(); });
 window.addEventListener('pagehide', () => { try { if (NET.peer) NET.peer.destroy(); } catch (e) {} });
@@ -4051,7 +4180,10 @@ function guestJoin(raw) {
 function guestData(m) {
   if (!m || typeof m !== 'object') return;
   if (m.t === 'hello') {
-    if (m.W !== W || m.H !== H) { location.replace(location.pathname + '?join=' + NET.code + '&o=' + (m.p ? 'p' : 'l')); return; }   // reload in the host's canvas shape
+    if (m.W !== W || m.H !== H) {
+      if (!canvasSize(m.W, m.H)) { guestLeave('The host sent an unsupported canvas size.'); return; }
+      location.replace(location.pathname + '?join=' + NET.code + '&o=' + (m.p ? 'p' : 'l') + '&w=' + m.W + '&h=' + m.H); return;
+    }
     NET.live = true; $('npGInfo').textContent = 'Connected to room ' + NET.code + '. You are drawing on the host’s canvas.';
     netTag('room ' + NET.code, !NET.hasVideo); netOpen(false); keepAwake(); netPtr('m');
   } else if (m.t === 'st') {
@@ -4112,6 +4244,7 @@ $('npCode').addEventListener('input', e => { e.target.value = e.target.value.toU
 { const jm = /[?&]join=([A-Za-z0-9]{5})(?![A-Za-z0-9])/.exec(location.search); if (jm) { netOpen(true); guestJoin(jm[1]); } }
 
 let last = performance.now(), acc = 0, fc = 0, fAcc = 0, stepMs = 8, gHi = 0, gLo = 0;
+document.addEventListener('visibilitychange', () => { last = performance.now(); acc = 0; });
 // Frame governor: work = ms of simulation + drawing per displayed frame (16.7 would be a steady 60 fps).
 // Too slow for a while -> drop to the next quality level (fewer pressure sweeps, then lighting off); lots of headroom -> back up.
 function govern(work) {
@@ -4122,7 +4255,7 @@ function govern(work) {
 }
 function frameBody(now) {
   if (NET.role === 'guest') { guestFrame(now); return; }
-  const dt = now - last; last = now;
+  const dt = Math.max(0, now - last); last = now;
   fAcc += dt; fc++;
   if (fAcc > 500) {
     const fps = Math.round(fc * 1000 / fAcc);
@@ -4134,17 +4267,21 @@ function frameBody(now) {
   if (NET.actors.length) netActorsPaint();                              // ... and the friends' brushes
   let nSteps = 0;
   if (!paused) {
-    // fixed 60 Hz simulation time, unlimited steps per frame
-    acc += dt;
-    while (acc >= 16.67) {
+    // Fixed 60 Hz ticks, bounded catch-up: expensive scenes must not accumulate
+    // seconds of work and freeze the next frame (especially after a background tab).
+    acc = Math.min(acc + dt, 33.34);
+    const simStart = performance.now(), budget = Math.max(2, 16.67 - renderMs);
+    while (acc >= 16.67 && nSteps < 2) {
+      if (nSteps && performance.now() - simStart >= budget) break;
       const s0 = performance.now(); step(); stepMs += (performance.now() - s0 - stepMs) * 0.15;
       acc -= 16.67; nSteps++;
     }
-  }
+    if (acc >= 16.67) acc %= 16.67;
+  } else acc = 0;
   render();
   if (NET.actors.length) netHostFrame(now);                             // copy the picture to the stream, tell friends the state
   if (!paused) govern(stepMs * nSteps + renderMs);
-  if (TEXQ.length) texPump(IS_TOUCH ? 4 : 6);          // material textures are baked in the background, a few ms per frame
+  if (TEXQ.length) texPump(Math.max(0.5, Math.min(IS_TOUCH ? 4 : 6, 16.67 - stepMs * nSteps - renderMs)));          // material textures are baked in the background, a few ms per frame
   if ((rc & 7) === 0 && mx >= 0 && inb(mx, my)) {
     const i = my * W + mx;
     let nm = 'Air';
