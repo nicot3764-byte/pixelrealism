@@ -813,7 +813,7 @@ const HS = new Float32Array(N);                          // pressure at a liquid
 const FUa = new Float32Array(GN), FVa = new Float32Array(GN), FTa = new Float32Array(GX);   // flow summed over the sub-steps: what really moved this frame
 const FU = new Float32Array(GN), FV = new Float32Array(GN), FT = new Float32Array(GX), FXo = new Uint8Array(GN), FYo = new Uint8Array(GN), PRS = new Float32Array(GN);
 const PST = new Uint8Array(N);                           // how close each breakable wall pixel is to giving way (shown in the pressure view)
-const P_MAX = 24, P_SUB = 4, P_KG = 0.6, P_KC = 0.75, P_FDAMP = 0.95, P_FMAX = 12, P_LEAK = 0.9995, P_VMAX = 4;
+const P_MAX = 24, P_SUB = 3, P_KG = 0.6, P_KC = 0.75, P_FDAMP = 0.95, P_FMAX = 12, P_LEAK = 0.9995, P_VMAX = 4;
 const L_PSCALE = 2, L_PSCALE_INV = 0.5;                  // liquid solver pressure x2 = pressure in air units (it works per 2px cell)
 const L_AIRDRAG = 0.06, P_GDEN = 1.2, P_GAS = 1, P_LIQ = 0.6, P_BODY = 0.8, K_WIND = 0.1, P_LIFT = 0.1, P_K = 25;
 let pB0 = 0, pB1 = -1, pBj0 = 0, pBj1 = -1;              // the pressure working box (cells), so the gas transport only visits where pressure flows
@@ -4116,8 +4116,8 @@ let last = performance.now(), acc = 0, fc = 0, fAcc = 0, stepMs = 8, gHi = 0, gL
 // Too slow for a while -> drop to the next quality level (fewer pressure sweeps, then lighting off); lots of headroom -> back up.
 function govern(work) {
   const hi = IS_TOUCH ? 22 : 18, lo = IS_TOUCH ? 11 : 9;
-  if (work > hi) { gLo = 0; if (++gHi > 20 && qLevel < 3) { setQuality(qLevel + 1); gHi = 0; } }
-  else if (work < lo) { gHi = 0; if (++gLo > 180 && qLevel > 0) { setQuality(qLevel - 1); gLo = 0; } }
+  if (work > hi) { gLo = 0; if (++gHi > 12 && qLevel < 3) { setQuality(qLevel + 1); gHi = 0; } }
+  else if (work < lo) { gHi = 0; if (++gLo > 120 && qLevel > 0) { setQuality(qLevel - 1); gLo = 0; } }
   else { gHi = 0; gLo = 0; }
 }
 function frameBody(now) {
