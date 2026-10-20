@@ -34,3 +34,5 @@ npm run test:desktop
 The desktop parity suite compares every rendered pixel and all tested simulation buffers byte for byte at twelve checkpoints across pond, empty, mixed chemistry and repeated-breaking scenes. It also exercises the actual Electron application, its sandbox, native canvas prompt, accept/cancel/reset, persisted dimensions/orientation, local PeerJS loading, public invite links and game controls. The existing regression suites cover over 100,000 liquid particles, heat/render parity and exact fragment geometry.
 
 Tests of the application run on Linux with the headless Electron platform. The Windows PE executable is cross-packaged here; it still needs a run on a Windows machine for driver-specific FPS validation.
+
+Measured headless CPU speedups in this environment were 1.140× for the starting pond, 1.024× for an empty canvas, 1.061× for 12,000 water particles and 1.009× after repeated breaking. These use unchanged full quality and a fixed tick plus render. See `performance.json` for the three-run measurements. Near-1% differences may be measurement noise; these are not measured Windows FPS gains.
