@@ -1,0 +1,40 @@
+{
+  "name": "pixelrealism-desktop",
+  "version": "1.0.0",
+  "description": "PixelRealism standalone Windows edition",
+  "main": "desktop/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "desktop:prepare": "node scripts/prepare-desktop.cjs",
+    "desktop:build": "node scripts/build-windows.cjs",
+    "test": "node tests/browser.cjs && node tests/destruction.cjs",
+    "test:desktop": "node tests/desktop.cjs",
+    "desktop:portable": "npm run desktop:build && electron-builder --prepackaged dist/PixelRealism-win32-x64 --win portable --x64 --config electron-builder.yml"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nicot3764-byte/pixelrealism.git"
+  },
+  "keywords": [],
+  "author": "nicot3764-byte",
+  "license": "UNLICENSED",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/nicot3764-byte/pixelrealism/issues"
+  },
+  "homepage": "https://github.com/nicot3764-byte/pixelrealism#readme",
+  "devDependencies": {
+    "@electron/asar": "^4.3.1",
+    "@electron/packager": "^20.3.0",
+    "acorn": "^8.19.0",
+    "acorn-walk": "^8.3.5",
+    "electron": "44.9.1",
+    "electron-builder": "26.15.3",
+    "playwright": "1.51.1"
+  },
+  "productName": "PixelRealism",
+  "private": true,
+  "dependencies": {
+    "peerjs": "1.5.4"
+  }
+}
