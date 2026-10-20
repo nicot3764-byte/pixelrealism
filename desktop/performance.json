@@ -1,0 +1,181 @@
+{
+  "browser": "134.0.6998.35",
+  "quality": "full, fixed one tick + render, median of three batches of 15 after 20 warmup ticks; three runs, alternating version order",
+  "platform": "linux",
+  "summary": [
+    {
+      "scene": "pond",
+      "originalMs": 25.09,
+      "compiledMs": 22.01,
+      "speedup": 1.14,
+      "lessCPUPercent": 12.3
+    },
+    {
+      "scene": "empty",
+      "originalMs": 15.39,
+      "compiledMs": 15.03,
+      "speedup": 1.024,
+      "lessCPUPercent": 2.4
+    },
+    {
+      "scene": "12000 water particles",
+      "originalMs": 22.09,
+      "compiledMs": 20.81,
+      "speedup": 1.061,
+      "lessCPUPercent": 5.8
+    },
+    {
+      "scene": "repeated breaking",
+      "originalMs": 25.58,
+      "compiledMs": 25.34,
+      "speedup": 1.009,
+      "lessCPUPercent": 0.9
+    }
+  ],
+  "results": [
+    {
+      "run": 0,
+      "version": "original",
+      "scene": "pond",
+      "ms": 24.660000000001553
+    },
+    {
+      "run": 0,
+      "version": "original",
+      "scene": "empty",
+      "ms": 15.173333333331781
+    },
+    {
+      "run": 0,
+      "version": "original",
+      "scene": "12000 water particles",
+      "ms": 24.953333333328676
+    },
+    {
+      "run": 0,
+      "version": "original",
+      "scene": "repeated breaking",
+      "ms": 25.580000000004656
+    },
+    {
+      "run": 0,
+      "version": "compiled",
+      "scene": "pond",
+      "ms": 23.47333333333178
+    },
+    {
+      "run": 0,
+      "version": "compiled",
+      "scene": "empty",
+      "ms": 15.026666666668218
+    },
+    {
+      "run": 0,
+      "version": "compiled",
+      "scene": "12000 water particles",
+      "ms": 20.813333333330228
+    },
+    {
+      "run": 0,
+      "version": "compiled",
+      "scene": "repeated breaking",
+      "ms": 25.76000000000155
+    },
+    {
+      "run": 1,
+      "version": "compiled",
+      "scene": "pond",
+      "ms": 22.006666666672874
+    },
+    {
+      "run": 1,
+      "version": "compiled",
+      "scene": "empty",
+      "ms": 15.986666666669771
+    },
+    {
+      "run": 1,
+      "version": "compiled",
+      "scene": "12000 water particles",
+      "ms": 20.266666666666666
+    },
+    {
+      "run": 1,
+      "version": "compiled",
+      "scene": "repeated breaking",
+      "ms": 23.706666666672877
+    },
+    {
+      "run": 1,
+      "version": "original",
+      "scene": "pond",
+      "ms": 25.08666666666977
+    },
+    {
+      "run": 1,
+      "version": "original",
+      "scene": "empty",
+      "ms": 15.660000000001553
+    },
+    {
+      "run": 1,
+      "version": "original",
+      "scene": "12000 water particles",
+      "ms": 22.093333333334886
+    },
+    {
+      "run": 1,
+      "version": "original",
+      "scene": "repeated breaking",
+      "ms": 28.2
+    },
+    {
+      "run": 2,
+      "version": "original",
+      "scene": "pond",
+      "ms": 25.91333333333799
+    },
+    {
+      "run": 2,
+      "version": "original",
+      "scene": "empty",
+      "ms": 15.393333333327124
+    },
+    {
+      "run": 2,
+      "version": "original",
+      "scene": "12000 water particles",
+      "ms": 21.306666666665116
+    },
+    {
+      "run": 2,
+      "version": "original",
+      "scene": "repeated breaking",
+      "ms": 25.353333333336437
+    },
+    {
+      "run": 2,
+      "version": "compiled",
+      "scene": "pond",
+      "ms": 21.979999999996895
+    },
+    {
+      "run": 2,
+      "version": "compiled",
+      "scene": "empty",
+      "ms": 13.633333333333333
+    },
+    {
+      "run": 2,
+      "version": "compiled",
+      "scene": "12000 water particles",
+      "ms": 22.78666666666201
+    },
+    {
+      "run": 2,
+      "version": "compiled",
+      "scene": "repeated breaking",
+      "ms": 25.339999999998447
+    }
+  ]
+}
