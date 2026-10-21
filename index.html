@@ -2883,7 +2883,7 @@ function lifeNew(sp, x, y) {
   const e = { id: lifeId++, sp, x, y, vx: 0, vy: 0, want: 0, jumpReq: false, dir: Math.random() < 0.5 ? -1 : 1, hp: S.hp, dead: false, deadT: 0, cause: '',
     lie: false, ground: false, flung: false, blocked: 0, hunger: 5 + Math.random() * 25, thirst: 5 + Math.random() * 25, energy: 70 + Math.random() * 30,
     warm: 80, stam: 100, breath: 100, burn: 0, char: 0, bodyT: 37, age: 0, think: (Math.random() * 20) | 0, task: null, doing: 'looking around',
-    anim: 0, act: 0, hurtT: 0, alarm: 0, bestD: 1e9, stuckT: 0, digT: 0, bad: [], wood: 0, stone: 0, meat: 0, cooked: 0, berries: 0, seeds: 0, spear: false,
+    anim: 0, act: 0, hurtT: 0, alarm: 0, bestD: 1e9, stuckT: 0, digT: 0, bad: [], wood: 0, stone: 0, meat: 0, cooked: 0, berries: 0, seeds: 0, spear: false, bow: false, arrows: 0, fiber: 0, sinew: 0, skill: 0, shotCd: 0,
     throwCd: 0, hitCd: 0, fireCd: 0, sub: 0, airT: AMBIENT, tone: 0.92 + Math.random() * 0.16, meatLeft: S.meat };
   if (sp === HU) { e.name = rnd(NAMES); e.skin = rnd(SKIN); e.hair = rnd(HAIR); e.shirt = rnd(SHIRT); e.pants = rnd(PANTS); }
   if (sp === DEER) e.antlers = Math.random() < 0.45;
@@ -3311,15 +3311,22 @@ function spearStep() {
     s.t++;
     if (s.fly) {
       for (let sub = 0; sub < 4 && s.fly; sub++) {
+        if (s.kind === 'arrow') { s.vx += windAt(s.x, s.y) * AR_WIND / 4; if (s.fire && (sub & 1)) { const fx = Math.round(s.x), fy = Math.round(s.y); if (inb(fx, fy)) addHeatFlame(fy * W + fx, 700, 0.12, 0.01); } }
         s.x += s.vx / 4; s.y += s.vy / 4; s.vy += 0.1 / 4;
         const x = Math.round(s.x), y = Math.round(s.y);
         if (x < 0 || x >= W || y >= H) { s.fly = false; s.x = Math.max(1, Math.min(W - 2, s.x)); s.y = Math.min(H - 2, s.y); break; }
-        if (y >= 0 && type[y * W + x]) { s.fly = false; s.x -= s.vx / 4; s.y -= s.vy / 4; break; }
+        if (y >= 0 && type[y * W + x]) {
+          if (s.fire && IGN[type[y * W + x]] < 1e9) ignite(y * W + x);
+          s.fly = false; s.stuck = s.kind === 'arrow'; s.ang = Math.atan2(s.vy, s.vx); s.x -= s.vx / 4; s.y -= s.vy / 4; break;
+        }
         if (y >= 0 && lOcc[y * W + x]) { s.vx *= 0.9; s.vy *= 0.9; }
         for (const o of LIFE) {
           if (o.dead || o.id === s.owner || o.sp === HU) continue;
           if (s.x >= o.x - 0.5 && s.x <= o.x + bw(o) + 0.5 && s.y >= o.y - 0.5 && s.y <= o.y + bh(o) + 0.5) {
-            lifeHurt(o, (s.q === 2 ? 50 : 36) + Math.random() * 12, 'speared'); o.vx += s.vx * 0.15;
+            const arrow = s.kind === 'arrow';
+            lifeHurt(o, arrow ? (s.q === 2 ? 34 : 26) + Math.random() * 10 : (s.q === 2 ? 50 : 36) + Math.random() * 12, arrow ? 'shot by an arrow' : 'speared'); o.vx += s.vx * 0.15;
+            if (s.fire) o.burn = Math.max(o.burn, 300);
+            for (const a of LIFE) if (a.id === s.owner && a.sp === HU) a.skill = Math.min(1, a.skill + 0.08);
             if (o.sp === WOLF) { o.alarm = 120; o.foe = s.owner; }
             s.fly = false; s.vx = 0; s.vy = 0; break;
           }
@@ -3327,13 +3334,54 @@ function spearStep() {
       }
     } else {                                                    // a spear on the ground drops until it rests on something
       const x = Math.round(s.x), y = Math.round(s.y) + 1;
-      if (y < H && !(inb(x, y) && type[y * W + x])) { s.y += 1; s.vy = 0; }
+      if (s.stuck) { const sx = Math.round(s.x + Math.cos(s.ang) * 1.5), sy = Math.round(s.y + Math.sin(s.ang) * 1.5); if (!inb(sx, sy) || !type[sy * W + sx]) s.stuck = false; }   // stuck in a tree or wall until that falls away
+      else if (y < H && !(inb(x, y) && type[y * W + x])) { s.y += 1; s.vy = 0; }
     }
-    if (s.y > H + 5 || s.t > 20000) SPEARS.splice(k, 1);
+    if (s.y > H + 5 || s.t > (s.kind === 'arrow' ? 9000 : 20000)) SPEARS.splice(k, 1);
   }
 }
 
 // ---------- humans ----------
+const canBow = e => !e.bow && e.wood >= 6 && (e.fiber >= 3 || e.sinew >= 1);
+const armed = e => e.spear || (e.bow && e.arrows > 0);
+const AR_V = 4.6, AR_G = 0.1, AR_WIND = 0.006;      // arrow speed, gravity and how strongly the air carries it
+function windAt(x, y) { const gi = Math.min(GX - 1, Math.max(0, (x / GS) | 0)), gj = Math.min(GY - 1, Math.max(0, (y / GS) | 0)); return AX[gj * GX + gi]; }
+function aimShot(e, o) {
+  // pick the low arc that lands on the target: lead a moving target, aim against the wind (feeling it where they stand and
+  // halfway there), then check the flight path isn't blocked. Returns [vx, vy] or null
+  const sx = cxOf(e) + e.dir * 2, sy = e.y + 3;
+  let tx = cxOf(o), ty = cyOf(o);
+  const wind = (windAt(sx, sy) + windAt((sx + tx) / 2, (sy + ty) / 2)) * 0.5 * AR_WIND;
+  for (let it = 0; it < 3; it++) {
+    const X = tx - sx, Y = sy - ty, v2 = AR_V * AR_V, ax = Math.abs(X);
+    const disc = v2 * v2 - AR_G * (AR_G * X * X + 2 * Y * v2);
+    if (disc < 0 || ax < 2) return null;
+    const th = Math.atan2(v2 - Math.sqrt(disc), AR_G * ax), vx = Math.sign(X) * AR_V * Math.cos(th), vy = -AR_V * Math.sin(th);
+    const t = ax / Math.abs(vx);
+    if (it === 2) {
+      // fly it in our head first: does it clear the ground and trees?
+      let x = sx, y = sy, ux = vx, uy = vy;
+      for (let k = 0; k < t * 2 && k < 200; k++) {
+        ux += wind * 0.5; uy += AR_G * 0.5; x += ux * 0.5; y += uy * 0.5;
+        if (Math.abs(x - cxOf(o)) < bw(o) / 2 + 1 && Math.abs(y - cyOf(o)) < bh(o) / 2 + 1) return [vx, vy];
+        const ix = Math.round(x), iy = Math.round(y);
+        if (ix < 0 || ix >= W || iy >= H) return null;
+        if (iy >= 0 && type[iy * W + ix]) return null;
+      }
+      return [vx, vy];
+    }
+    tx = cxOf(o) + o.vx * t * 0.8 - 0.5 * wind * t * t;     // lead it, and lean into the wind
+  }
+  return null;
+}
+function shootArrow(e, o, fire) {
+  const a = aimShot(e, o);
+  if (!a) return false;
+  const miss = 0.16 * (1 - e.skill) + 0.02;                     // practice makes perfect
+  SPEARS.push({ kind: 'arrow', x: cxOf(e) + e.dir * 2, y: e.y + 3, vx: a[0] * (1 + (Math.random() - 0.5) * miss * 0.4), vy: a[1] + (Math.random() - 0.5) * miss, fly: true, owner: e.id, t: 0, q: e.stone >= 1 ? 2 : 1, fire: !!fire });
+  e.arrows--; e.act = 10; e.shotCd = 40;
+  return true;
+}
 const canCraft = e => (e.wood >= 6 && e.stone >= 3) || e.wood >= 8;
 function foodScore(e) { return e.cooked * 3 + e.berries + e.meat * 1.5; }
 function humanThink(e, S) {
@@ -3355,7 +3403,8 @@ function humanThink(e, S) {
     }
     const carc = nearest(e, o => o.dead && o.sp !== HU && o.meatLeft > 0, 160);
     if (carc) return setTask(e, 'butcher', { o: carc });
-    if (e.spear) { const p = huntTarget(e); if (p) return setTask(e, 'hunt', { o: p }); }
+    if (armed(e)) { const p = huntTarget(e); if (p) return setTask(e, 'hunt', { o: p }); }
+    if (e.bow && !e.arrows && e.wood >= 1) return setTask(e, 'fletch');
     if (!e.spear && SPEARS.length) { const sp = spearNear(e, 200); if (sp) return setTask(e, 'fetch', { s: sp }); }
     const pl = findCell(e, isPlantAt, 170);
     if (pl >= 0) return setTask(e, 'forage', { x: pl % W, y: (pl / W) | 0 });
@@ -3363,7 +3412,7 @@ function humanThink(e, S) {
   }
   // threats: a wolf nearby
   const wolf = nearest(e, o => o.sp === WOLF && !o.dead, 90);
-  if (wolf) { if (e.spear || (e.hp > 60 && nearest(e, o => o.sp === HU && !o.dead && o.spear, 60))) return setTask(e, 'hunt', { o: wolf, defend: true }); }
+  if (wolf) { if (armed(e) || (e.hp > 60 && nearest(e, o => o.sp === HU && !o.dead && armed(o), 60))) return setTask(e, 'hunt', { o: wolf, defend: true }); }
   if (e.meat) { const f = nearFire(e, 220); if (f) return setTask(e, 'cook', { f }); if (e.wood >= 8) return setTask(e, 'campfire'); }
   if (e.warm < 55) { const f = nearFire(e, 220); if (f) return setTask(e, 'warm', { f }); if (e.wood >= 8) return setTask(e, 'campfire'); }
   if (e.energy < 25) { const f = nearFire(e, 200); return setTask(e, 'rest', { f }); }
@@ -3373,7 +3422,11 @@ function humanThink(e, S) {
     if (!camp.lit) return setTask(e, camp.fuel >= 4 ? 'kindle' : (e.wood >= 8 ? 'campfire' : 'gatherwood'), { f: camp, x: camp.x, y: camp.y });
     if (camp.burning < 3 && camp.lit) return setTask(e, 'feed', { f: camp });
   }
-  if (!e.spear) {
+  if (canBow(e)) return setTask(e, 'craftbow');
+  if (e.bow && e.arrows < 4 && e.wood >= 2) return setTask(e, 'fletch');
+  if (e.bow && e.arrows < 10 && SPEARS.length) { const ar = spearNear(e, 140, 'arrow'); if (ar) return setTask(e, 'fetch', { s: ar }); }
+  if (!e.bow && e.fiber < 3 && !e.sinew && e.wood >= 6 && Math.random() < 0.4) { const pl = findCell(e, isPlantAt, 150); if (pl >= 0) return setTask(e, 'forage', { x: pl % W, y: (pl / W) | 0 }); }
+  if (!e.spear && !(e.bow && e.arrows)) {
     if (SPEARS.length) { const sp = spearNear(e, 160); if (sp) return setTask(e, 'fetch', { s: sp }); }
     if (canCraft(e)) return setTask(e, 'craft');
     if (e.stone < 3 && e.wood >= 6) { const s = findCell(e, isStoneAt, 140, 'stone'); if (s >= 0) return setTask(e, 'mine', { x: s % W, y: (s / W) | 0 }); }
@@ -3381,7 +3434,7 @@ function humanThink(e, S) {
   }
   if (e.wood < 14) { const w = findCell(e, isWoodAt, 220); if (w >= 0) return setTask(e, 'chop', { x: w % W, y: (w / W) | 0 }); }
   if (!camp && e.wood >= 8 && Math.random() < 0.5) return setTask(e, 'campfire');
-  if (e.spear && hungry > 20 && foodScore(e) < 3) { const p = huntTarget(e); if (p) return setTask(e, 'hunt', { o: p }); }
+  if (armed(e) && hungry > 20 && foodScore(e) < 3) { const p = huntTarget(e); if (p) return setTask(e, 'hunt', { o: p }); }
   if (e.seeds > 0 && Math.random() < 0.5) { const s = findCell(e, isSoilAt, 120); if (s >= 0) return setTask(e, 'sow', { x: s % W, y: (s / W) | 0 }); }
   if (e.berries < 3 && hungry > 15 && Math.random() < 0.4) { const pl = findCell(e, isPlantAt, 120); if (pl >= 0) return setTask(e, 'forage', { x: pl % W, y: (pl / W) | 0 }); }
   if (e.stone < 6 && Math.random() < 0.25) { const s = findCell(e, isStoneAt, 120); if (s >= 0) return setTask(e, 'mine', { x: s % W, y: (s / W) | 0 }); }
@@ -3389,9 +3442,10 @@ function humanThink(e, S) {
   if (camp && Math.abs(camp.x - cx) > 30 && Math.abs(camp.x - cx) < 320) return setTask(e, 'camp', { x: camp.x + (Math.random() - 0.5) * 30 });
   return setTask(e, 'wander', { x: Math.max(4, Math.min(W - 4, cx + (Math.random() - 0.5) * 120)) });
 }
-function spearNear(e, R) {
+function spearNear(e, R, kind) {
   let best = null, bd = R;
-  for (const s of SPEARS) { if (s.fly || s.bad > frame) continue; const d = Math.abs(s.x - cxOf(e)) + Math.abs(s.y - cyOf(e)); if (d < bd) { bd = d; best = s; } }
+  kind = kind || 'spear';
+  for (const s of SPEARS) { if (s.fly || s.bad > frame || (s.kind || 'spear') !== kind) continue; const d = Math.abs(s.x - cxOf(e)) + Math.abs(s.y - cyOf(e)); if (d < bd) { bd = d; best = s; } }
   return best;
 }
 function huntTarget(e) {
@@ -3443,6 +3497,7 @@ function humanTask(e, S) {
           if (tp === ID.WOOD) { e.wood++; if (Math.random() < 0.35) addGrain(ID.SAWDUST, x + 0.5, y + 0.5, -e.dir * 0.3 * Math.random(), -0.3 - Math.random() * 0.3); }
           else if (tp === ID.PLANT) {
             if (Math.random() < 0.5) e.berries++;
+            if (Math.random() < 0.4) e.fiber++;
             if (Math.random() < 0.15) e.seeds++;
             if (Math.random() < 0.25) e.wood++;
           } else { e.stone++; if (Math.random() < 0.3) addGrain(ID.GRAVEL, x + 0.5, y + 0.5, -e.dir * 0.3, -0.4); }
@@ -3483,13 +3538,29 @@ function humanTask(e, S) {
       if (t.t > 120) { if (e.wood >= 6 && e.stone >= 3) { e.wood -= 6; e.stone -= 3; e.spear = 2; } else if (e.wood >= 8) { e.wood -= 8; e.spear = 1; } e.task = null; }
       break;
     }
+    case 'craftbow': {
+      e.doing = 'making a bow'; e.want = 0; e.act = 3;
+      if (t.t > 150) { if (canBow(e)) { e.wood -= 6; if (e.sinew) e.sinew--; else e.fiber -= 3; e.bow = true; e.arrows += 2; } e.task = null; e.think = 0; }
+      break;
+    }
+    case 'fletch': {
+      e.doing = 'making arrows'; e.want = 0; e.act = 2;
+      if (t.t % 50 === 49) { if (e.wood >= 1 && e.arrows < 12) { e.wood--; e.arrows += 2; } else { e.task = null; e.think = 0; } }
+      if (e.arrows >= 8) { e.task = null; e.think = 0; }
+      break;
+    }
     case 'fetch': {
-      const s = t.s;
-      if (!s || SPEARS.indexOf(s) < 0 || e.spear) { e.task = null; break; }
-      e.doing = 'picking up a spear';
+      const s = t.s, isArrow = s && s.kind === 'arrow';
+      if (!s || SPEARS.indexOf(s) < 0 || (!isArrow && e.spear) || (isArrow && !e.bow)) { e.task = null; break; }
+      e.doing = isArrow ? 'collecting arrows' : 'picking up a spear';
       if (s.fly) { e.want = 0; break; }
       const sxi = Math.round(s.x), syi = Math.round(s.y), sunk = inb(sxi, syi) && lOcc[syi * W + sxi] > 0;
-      if (Math.abs(s.x - cxOf(e)) < 3 && Math.abs(s.y - cyOf(e)) < (sunk ? 24 : 9)) { SPEARS.splice(SPEARS.indexOf(s), 1); e.spear = s.q || 1; e.task = null; e.think = 0; break; }
+      if (Math.abs(s.x - cxOf(e)) < 3 && Math.abs(s.y - cyOf(e)) < (sunk ? 24 : 9)) {
+        SPEARS.splice(SPEARS.indexOf(s), 1);
+        if (isArrow) { e.arrows++; const nx = spearNear(e, 60, 'arrow'); if (nx && e.arrows < 12) { t.s = nx; t.t = 0; t.wait = 0; break; } }
+        else e.spear = s.q || 1;
+        e.task = null; e.think = 0; break;
+      }
       const r = steer(e, S, s.x, 1, true);
       if (r < 0 || (r === 1 && ++t.wait > 80) || t.t > 1500) { s.bad = frame + 3000; e.task = null; e.think = 0; }
       break;
@@ -3501,12 +3572,22 @@ function humanTask(e, S) {
       const d = dist(e, o), dx = cxOf(o) - cxOf(e), dy = cyOf(o) - cyOf(e);
       e.doing = (t.defend ? 'fighting a ' : 'hunting a ') + SPECIES[o.sp].n.toLowerCase();
       if (d > S.sight * 1.4 || t.t > 3000) { e.task = null; break; }
-      if (!e.spear && o.sp !== WOLF) {
-        const sp = spearNear(e, 140);
+      if (!armed(e) && o.sp !== WOLF) {
+        const sp = spearNear(e, 140, e.bow ? 'arrow' : 'spear');
         if (sp) { setTask(e, 'fetch', { s: sp }); break; }
         e.task = null; break;
       }
-      e.throwCd--; e.hitCd--;
+      e.throwCd--; e.hitCd--; e.shotCd--;
+      // bow: shoot from well outside the range where prey notices. Against wolves, light the arrow at a nearby campfire
+      if (e.bow && e.arrows > 0 && d > 10 && d < 190) {
+        if (e.shotCd <= 0) {
+          e.dir = dx > 0 ? 1 : -1; e.want = 0;
+          t.aim = (t.aim || 0) + 1;
+          e.doing = 'drawing the bow';
+          if (t.aim > 18) { t.aim = 0; const fire = o.sp === WOLF && !!nearFire(e, 40); if (!shootArrow(e, o, fire)) { t.noShot = (t.noShot || 0) + 1; } else t.noShot = 0; }
+          if ((t.noShot || 0) < 3) break;                        // no clear arc from here: walk closer
+        } else if (d > 40 || o.sp !== WOLF) { e.want = 0; break; }
+      }
       if (d < 6) {
         e.want = 0; e.dir = dx > 0 ? 1 : -1;
         if (e.hitCd <= 0) { e.hitCd = 26; e.act = 10; lifeHurt(o, e.spear ? 22 + e.spear * 6 : 7, e.spear ? 'speared' : 'beaten'); if (o.sp === WOLF) o.foe = e.id; }
@@ -3519,7 +3600,7 @@ function humanTask(e, S) {
         e.doing = 'throwing a spear';
         break;
       }
-      t.aim = 0;
+      if (!e.bow) t.aim = 0;
       // sneak up on prey that hasn't noticed yet, run once it bolts
       const r = steer(e, S, cxOf(o), 4, o.alarm > 0 || d < 30 || o.sp === WOLF, false);
       if (r < 0) { e.task = null; markBad(e, cxOf(o) | 0, cyOf(o) | 0); }
@@ -3531,7 +3612,7 @@ function humanTask(e, S) {
       e.doing = 'butchering a ' + SPECIES[o.sp].n.toLowerCase();
       if (Math.abs(cxOf(o) - cxOf(e)) < bw(o) / 2 + 3 && Math.abs(feetOf(o) - feetOf(e)) < 8) {
         e.want = 0; e.act = 5; e.dir = cxOf(o) > cxOf(e) ? 1 : -1;
-        if (t.t % 45 === 0) { o.meatLeft--; e.meat++; bleed(cxOf(o), o.y + 1, 2); if (o.meatLeft <= 0) { o.deadT = 1e9; e.task = null; } }
+        if (t.t % 45 === 0) { if (o.meatLeft === SPECIES[o.sp].meat) e.sinew++; o.meatLeft--; e.meat++; bleed(cxOf(o), o.y + 1, 2); if (o.meatLeft <= 0) { o.deadT = 1e9; e.task = null; } }
         break;
       }
       if (steer(e, S, cxOf(o), bw(o) / 2 + 2, false) < 0 || t.t > 1500) { e.task = null; }
@@ -3678,13 +3759,25 @@ function humanTick(e, S) {
     setTask(e, 'onfire', w >= 0 ? { x: w % W, y: (w / W) | 0 } : {});
     e.iconT = 60; e.icon = 2;
   }
+  if ((frame + e.id) % 3 === 0 && RBS.length && (!e.task || e.task.k !== 'onfire')) {
+    // something big is moving nearby (a tree they just cut, a falling slab): get out from under it
+    const cx = cxOf(e), feet = feetOf(e);
+    for (const rb of RBS) {
+      if (rb.resting || Math.abs(rb.vx) + Math.abs(rb.vy) + Math.abs(rb.w) * 6 < 0.12) continue;
+      const bx = rb.x + rb.mw / 2, by = rb.y + rb.mh / 2, R = Math.hypot(rb.mw, rb.mh) / 2 + 7;
+      if (Math.abs(bx - cx) < R && by < feet + 2 && feet - by < R + 14) {
+        if (!e.task || e.task.k !== 'flee' || !e.task.dodge) { setTask(e, 'flee', { x: cx + (cx < bx ? -1 : 1) * (R + 14), why: 'dodging something falling!', dur: 45, dodge: true }); e.iconT = 40; e.icon = 2; }
+        break;
+      }
+    }
+  }
   if ((frame + e.id) % 6 === 0 && (!e.task || (e.task.k !== 'onfire' && e.task.k !== 'flee'))) {
     const d = feelDanger(e);
     if (d) { setTask(e, 'flee', { x: cxOf(e) - Math.sign(d.x || e.dir) * 60, why: 'running from the heat!' }); e.iconT = 50; e.icon = 2; }
     else {
       const wolf = nearest(e, o => o.sp === WOLF && !o.dead && o.task && o.task.k === 'hunt' && o.task.o === e, 70);
-      if (wolf && !e.spear) { setTask(e, 'flee', { x: cxOf(e) + (cxOf(e) < cxOf(wolf) ? -90 : 90), why: 'running from a wolf!', dur: 120 }); e.iconT = 50; e.icon = 2; }
-      else if (wolf && e.spear && (!e.task || e.task.k !== 'hunt')) setTask(e, 'hunt', { o: wolf, defend: true });
+      if (wolf && !armed(e) && dist(e, wolf) < 40) { setTask(e, 'flee', { x: cxOf(e) + (cxOf(e) < cxOf(wolf) ? -90 : 90), why: 'running from a wolf!', dur: 120 }); e.iconT = 50; e.icon = 2; }
+      else if (wolf && armed(e) && (!e.task || e.task.k !== 'hunt')) setTask(e, 'hunt', { o: wolf, defend: true });
     }
   }
   if (--e.think <= 0) { e.think = 20 + ((Math.random() * 20) | 0); humanThink(e, S); }
@@ -3918,7 +4011,7 @@ function lifeLabel(e) {
   let s = nm + ' · ' + e.doing + ' · ♥' + Math.ceil(e.hp);
   if (e.sp === HU) {
     const inv = [];
-    if (e.spear) inv.push('spear'); if (e.wood) inv.push('wood ' + e.wood); if (e.stone) inv.push('stone ' + e.stone);
+    if (e.bow) inv.push('bow' + (e.skill > 0.3 ? ' (skilled)' : '')); if (e.bow || e.arrows) inv.push('arrows ' + e.arrows); if (e.spear) inv.push('spear'); if (e.wood) inv.push('wood ' + e.wood); if (e.stone) inv.push('stone ' + e.stone);
     if (e.meat) inv.push('raw meat ' + e.meat); if (e.cooked) inv.push('cooked ' + e.cooked); if (e.berries) inv.push('berries ' + e.berries); if (e.seeds) inv.push('seeds ' + e.seeds);
     s += ' · hunger ' + (e.hunger | 0) + '% · thirst ' + (e.thirst | 0) + '%' + (e.warm < 50 ? ' · cold' : '') + (inv.length ? ' · ' + inv.join(', ') : '');
   } else s += ' · hunger ' + (e.hunger | 0) + '%';
@@ -3996,6 +4089,12 @@ function drawHuman(e) {
     const sx = front + d * (e.act > 0 ? 2 : 1);
     for (let r = -3; r < 8; r++) P(sx, y0 + r, r < -1 ? [170, 172, 180] : [120, 86, 50]);
   }
+  if (e.bow && !e.spear) {                                         // the bow: a curved stave in front, string pulled back while drawing
+    const bx = front + d * 2, drawing = e.task && e.task.aim > 0 && e.task.k === 'hunt', st = [140, 96, 50], sg = [210, 210, 200];
+    P(bx - d, y0 + 1, st); P(bx, y0 + 2, st); P(bx, y0 + 3, st); P(bx, y0 + 4, st); P(bx, y0 + 5, st); P(bx - d, y0 + 6, st);
+    if (drawing) { P(front + d, y0 + 3, sk); P(front + d, y0 + 4, sg); P(bx + d, y0 + 3, [170, 172, 180]); }
+  } else if (e.bow) { const bx = back - d; P(bx, y0 + 2, [140, 96, 50]); P(bx, y0 + 6, [140, 96, 50]); for (let r = 3; r < 6; r++) P(bx - d, y0 + r, [140, 96, 50]); }
+  if (e.arrows > 0 && !e.wood) { const qx = back - d; P(qx, y0 + 3, [120, 80, 46]); P(qx, y0 + 4, [120, 80, 46]); P(qx, y0 + 2, [230, 230, 220]); }
   if (e.wood >= 6) { const wx = back - d; P(wx, y0 + 3, [112, 74, 40]); P(wx, y0 + 4, [96, 62, 34]); P(wx, y0 + 5, [112, 74, 40]); }
   // little signs above the head: heart when sharing, red ! when panicking
   if (e.iconT > 0 && !e.dead) {
@@ -4022,7 +4121,16 @@ function drawLife(heat) {
   }
   lifeHeat = false;
   for (const s of SPEARS) {
-    const a = s.fly ? Math.atan2(s.vy, s.vx) : 0, ca = Math.cos(a), sa = Math.sin(a);
+    const a = s.fly ? Math.atan2(s.vy, s.vx) : s.stuck ? s.ang : 0, ca = Math.cos(a), sa = Math.sin(a);
+    if (s.kind === 'arrow') {
+      for (let k = 0; k < 5; k++) {
+        const x = Math.round(s.x - ca * k), y = Math.round(s.y - sa * k);
+        if (heat) { lifeHeat = s.fire ? 600 : 24; lpx(x, y); lifeHeat = false; }
+        else if (k === 0) { if (s.fire && s.fly) lpx(x, y, 255, 170, 60); else lpx(x, y, 175, 178, 186); }
+        else if (k === 4) lpx(x, y, 235, 235, 228); else lpx(x, y, 128, 92, 54);
+      }
+      continue;
+    }
     for (let k = 0; k < 7; k++) {
       const x = Math.round(s.x - ca * k), y = Math.round(s.y - sa * k);
       if (heat) { lifeHeat = 24; lpx(x, y); lifeHeat = false; } else if (k < 2) lpx(x, y, 170, 172, 180); else lpx(x, y, 120, 86, 50);
@@ -4830,7 +4938,7 @@ const DESC = {
   RUBBER: 'Bouncy, unbreakable, burns with thick smoke', COPPER: 'Conducts heat best, turns green in water', TNT: 'Blows up when heated',
   HONEY: 'Very thick and slow', MERCURY: 'Liquid metal: so dense that even metal floats on it', NITRO: 'Explodes from heat or a hard knock',
   CO2: 'Heavy invisible gas: sinks, pools and puts out fires', HYDROGEN: 'Lightest gas, rises fast, burns explosively into steam',
-  HUMAN: 'Thinks for itself: drinks, chops wood, mines, picks plants, carves spears, hunts, builds and feeds campfires, cooks, shares food. Can burn, drown, freeze, starve and be crushed. Hover one to see what it is doing',
+  HUMAN: 'Thinks for itself: drinks, chops wood, mines, picks plants, carves spears, makes bows and arrows (aims for wind, gets better with practice, fire arrows against wolves), hunts, builds and feeds campfires, cooks, shares food. Can burn, drown, freeze, starve and be crushed. Hover one to see what it is doing',
   DEER: 'Grazes plants, drinks, runs from hunters and wolves. Meat for humans',
   RABBIT: 'Fast, skittish, breeds quickly when it finds plants',
   WOLF: 'Hunts in packs, eats carcasses, fears campfires. Attacks unarmed people',
