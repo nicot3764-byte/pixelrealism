@@ -339,10 +339,16 @@ const DEFS = [
   { key:'WIND', n:'Wind', c:[150,160,150], k:0, d:0, h:0 },
   { key:'AIR', n:'Air', c:[196,214,226], k:0, d:0, h:0 },
   { key:'VACUUM', n:'Vacuum', c:[132,98,176], k:0, d:0, h:0 },
+  // living things (agents drawn over the world, never cells)
+  { key:'HUMAN', n:'Human', c:[224,172,128], k:0, d:0, h:0 },
+  { key:'DEER', n:'Deer', c:[150,100,58], k:0, d:0, h:0 },
+  { key:'RABBIT', n:'Rabbit', c:[176,166,152], k:0, d:0, h:0 },
+  { key:'WOLF', n:'Wolf', c:[104,106,114], k:0, d:0, h:0 },
+  { key:'TREE', n:'Tree', c:[62,128,52], k:0, d:0, h:0 },
 ];
 const ID = {};
 DEFS.forEach((e, i) => { ID[e.key] = i; });
-const isTool = s => s === ID.HEAT || s === ID.COOL || s === ID.WIND || s === ID.AIR || s === ID.VACUUM;   // brush tools: they act on what is under the brush instead of placing material
+const isTool = s => s === ID.HEAT || s === ID.COOL || s === ID.WIND || s === ID.AIR || s === ID.VACUUM || (s >= ID.HUMAN && s <= ID.TREE);   // brush tools: they act on what is under the brush instead of placing material
 DEFS.forEach(e => {
   if (e.hotTo) e.hotTo = ID[e.hotTo];
   if (e.coldTo) e.coldTo = ID[e.coldTo];
@@ -1550,6 +1556,7 @@ function explode(x, y, bonus) {
   }
   // the blast throws whole pieces: moving bodies get an impulse now, resting ones are woken up with one
   blastQ.push(x, y, power, R);
+  lifeBlast(x, y, power, R);
   pressureBurst(x, y, R, power);                       // the blast is also a pressure wave: it shoves and cracks things beyond its fireball
   for (const rb of RBS) {
     const bx = (rb.comX ?? rb.x) - x, by = (rb.comY ?? rb.y) - y, d = Math.hypot(bx, by) || 1, reach = R * 4;
@@ -2839,8 +2846,1190 @@ function step() {
   airStep();
   conduct();
   liquidsFromPixels();
+  lifeStep();
   frame++;
 }
+
+// ======================= life: people and animals =======================
+// Creatures are small agents, not grid cells. They stand on and bump into the simulated solids and powders, swim in the
+// liquid particles and feel the air's heat and flames. Humans change the world by hand: they chop wood, mine stone, pick
+// plants, dig, sow seeds and build real campfires (wood cells that really burn). Everything alive can burn, drown,
+// freeze, starve, be crushed by falling pieces, blown up, bitten or speared.
+const SPECIES = [
+  { key:'HUMAN',  n:'Human',  w:3, h:10, hp:100, walk:0.36, run:0.74, jump:1.42, step:3, sight:200, meat:3, cap:150, cold:12 },
+  { key:'DEER',   n:'Deer',   w:8, h:7,  hp:70,  walk:0.3,  run:1.12, jump:1.5,  step:3, sight:120, meat:6, cap:36,  cold:-6 },
+  { key:'RABBIT', n:'Rabbit', w:3, h:3,  hp:16,  walk:0.32, run:1.18, jump:1.25, step:2, sight:90,  meat:2, cap:70,  cold:-8 },
+  { key:'WOLF',   n:'Wolf',   w:7, h:5,  hp:65,  walk:0.34, run:1.02, jump:1.5,  step:3, sight:170, meat:3, cap:14,  cold:-14 },
+];
+const HU = 0, DEER = 1, RABBIT = 2, WOLF = 3;
+const LIFE_SP = new Int8Array(DEFS.length).fill(-1);
+SPECIES.forEach((s, k) => { LIFE_SP[ID[s.key]] = k; });
+const isLifeTool = s => LIFE_SP[s] >= 0 || s === ID.TREE;
+const LIFE = [], SPEARS = [], BLOOD = [], FIRES = [], LIFE_MAX = 400;
+const LG = 0.12;                                   // gravity for creatures (px / tick²)
+const L_COUNT = [0, 0, 0, 0];
+let lifeId = 1, lifeLastSpawn = -99, camp = null, treeN = 0;
+const NAMES = ['Ada', 'Bo', 'Cyra', 'Dax', 'Eli', 'Fen', 'Gus', 'Hana', 'Ivo', 'Juno', 'Kai', 'Lia', 'Milo', 'Nia', 'Oto', 'Pia', 'Rex', 'Sol', 'Tia', 'Uma',
+  'Vik', 'Wren', 'Yara', 'Zed', 'Ash', 'Bea', 'Cal', 'Dina', 'Emil', 'Finn', 'Greta', 'Hugo', 'Ines', 'Jonas', 'Klara', 'Lukas', 'Mia', 'Nico', 'Olga', 'Paul',
+  'Rosa', 'Sepp', 'Theo', 'Ute', 'Vera', 'Willi', 'Anni', 'Bruno', 'Clara', 'Dora'];
+const SKIN = [[236, 196, 160], [214, 166, 124], [176, 122, 84], [128, 84, 56], [92, 60, 40]];
+const HAIR = [[40, 28, 20], [78, 50, 28], [150, 104, 52], [210, 180, 110], [120, 40, 24], [60, 60, 64], [20, 20, 22]];
+const SHIRT = [[178, 52, 46], [52, 104, 170], [64, 136, 72], [196, 150, 52], [120, 72, 150], [210, 210, 200], [60, 150, 150], [150, 90, 60]];
+const PANTS = [[54, 58, 80], [90, 70, 50], [60, 60, 60], [40, 70, 50], [110, 96, 70]];
+const rnd = a => a[(Math.random() * a.length) | 0];
+
+function lifeNew(sp, x, y) {
+  const S = SPECIES[sp];
+  const e = { id: lifeId++, sp, x, y, vx: 0, vy: 0, want: 0, jumpReq: false, dir: Math.random() < 0.5 ? -1 : 1, hp: S.hp, dead: false, deadT: 0, cause: '',
+    lie: false, ground: false, flung: false, blocked: 0, hunger: 5 + Math.random() * 25, thirst: 5 + Math.random() * 25, energy: 70 + Math.random() * 30,
+    warm: 80, stam: 100, breath: 100, burn: 0, char: 0, bodyT: 37, age: 0, think: (Math.random() * 20) | 0, task: null, doing: 'looking around',
+    anim: 0, act: 0, hurtT: 0, alarm: 0, bestD: 1e9, stuckT: 0, digT: 0, bad: [], wood: 0, stone: 0, meat: 0, cooked: 0, berries: 0, seeds: 0, spear: false,
+    throwCd: 0, hitCd: 0, fireCd: 0, sub: 0, airT: AMBIENT, tone: 0.92 + Math.random() * 0.16, meatLeft: S.meat };
+  if (sp === HU) { e.name = rnd(NAMES); e.skin = rnd(SKIN); e.hair = rnd(HAIR); e.shirt = rnd(SHIRT); e.pants = rnd(PANTS); }
+  if (sp === DEER) e.antlers = Math.random() < 0.45;
+  if (sp === RABBIT) e.fur = Math.random() < 0.5 ? [150, 134, 116] : [190, 186, 180];
+  if (sp === WOLF) e.fur = Math.random() < 0.6 ? [118, 118, 124] : [82, 78, 78];
+  return e;
+}
+const bw = e => e.lie && e.sp === HU ? SPECIES[HU].h : SPECIES[e.sp].w;
+const bh = e => e.lie && e.sp === HU ? 3 : SPECIES[e.sp].h;
+const cxOf = e => e.x + bw(e) / 2;
+const cyOf = e => e.y + bh(e) / 2;
+const feetOf = e => e.y + bh(e);
+function boxSolid(x0, y0, w, h) {               // solid cells overlapping a box (the canvas sides and floor count as solid, the sky is open)
+  let n = 0;
+  for (let y = y0; y < y0 + h; y++) {
+    if (y < 0) continue;
+    if (y >= H) { n += w; continue; }
+    const r = y * W;
+    for (let x = x0; x < x0 + w; x++) if (x < 0 || x >= W || type[r + x] !== 0) n++;
+  }
+  return n;
+}
+function setLie(e, on) {
+  if (e.lie === on || e.sp !== HU) return true;
+  const S = SPECIES[HU], fx = cxOf(e), fy = feetOf(e);
+  const w = on ? S.h : S.w, h = on ? 3 : S.h, x = Math.round(fx - w / 2), y = Math.round(fy - h);
+  for (const ox of [0, -2, 2, -4, 4]) if (!boxSolid(x + ox, y, w, h)) { e.lie = on; e.x = x + ox; e.y = y; return true; }
+  return false;
+}
+function lifeHurt(e, dmg, cause, bx, by) {
+  if (e.dead || dmg <= 0) return;
+  e.hp -= dmg; e.hurtT = 12;
+  if (dmg > 2 && cause !== 'burned' && cause !== 'froze' && cause !== 'starved' && cause !== 'drowned') bleed(cxOf(e), e.y + bh(e) * 0.4, Math.min(14, 2 + dmg / 6 | 0));
+  if (e.sp !== WOLF && e.sp !== HU && cause !== 'starved') e.alarm = 240;           // prey bolts when hurt
+  if (e.hp <= 0) lifeDie(e, cause);
+}
+function lifeDie(e, cause) {
+  e.dead = true; e.hp = 0; e.cause = cause; e.deadT = 0; e.task = null; e.want = 0; e.doing = 'dead';
+  if (e.sp === HU) { setLie(e, true); if (e.spear) { dropSpear(e); } }
+}
+function bleed(x, y, n) {
+  for (let k = 0; k < n && BLOOD.length < 900; k++)
+    BLOOD.push({ x, y, vx: (Math.random() - 0.5) * 1.2, vy: -Math.random() * 1.1, t: 0, stuck: -1 });
+}
+
+// ---------- senses and body ----------
+function lifeSense(e, ix, iy, w, h) {
+  let liq = 0, lava = 0, acid = 0, maxT = -300, sumT = 0, nT = 0, fl = 0, burnTouch = 0;
+  for (let y = iy; y < iy + h; y++) {
+    if (y < 0 || y >= H) continue;
+    for (let x = ix; x < ix + w; x++) {
+      if (x < 0 || x >= W) continue;
+      const c = y * W + x;
+      if (lOcc[c]) { liq++; const k = lKind[c]; if (k === 3) lava++; else if (k === 2) acid++; }
+      const T = temp[c]; if (T > maxT) maxT = T; sumT += T; nT++;
+      if (gF[c] > fl) fl = gF[c];
+    }
+  }
+  // burning fuel right next to the body (the side columns and under the feet)
+  for (let y = iy - 1; y <= iy + h; y++) for (const x of [ix - 1, ix + w]) {
+    if (!inb(x, y)) continue; const c = y * W + x; if (life[c] > 0 && IGN[type[c]] < 1e9) burnTouch++;
+  }
+  e.sub = liq / (w * h); e.lava = lava; e.acid = acid; e.maxT = maxT; e.flame = fl; e.burnTouch = burnTouch;
+  e.airT = nT ? sumT / nT : AMBIENT;
+  const hx = Math.round(ix + w / 2 - 0.5), hy = e.lie ? iy + 1 : iy + 1;
+  e.headWet = inb(hx, hy) && lOcc[hy * W + hx] > 0;
+}
+function lifeBody(e, S) {
+  const alive = !e.dead;
+  if (e.lava) { e.burn = Math.max(e.burn, 500); lifeHurt(e, 3 + 40 * e.lava / (bw(e) * bh(e)), 'melted in lava'); e.char = Math.min(1, e.char + 0.05); }
+  if (e.acid) lifeHurt(e, 0.25 * e.acid, 'dissolved in acid');
+  if (e.maxT > 70 && !(e.burn > 0 && e.maxT < 600)) lifeHurt(e, (e.maxT - 70) * 0.012, 'burned');
+  if (e.fireCd > 0) e.fireCd--;
+  if (e.burn <= 0 && (e.fireCd <= 0 || e.lava) && (e.flame > 0.22 || (e.burnTouch && Math.random() < 0.03) || e.maxT > 330)) e.burn = alive ? 260 + Math.random() * 200 : 700;
+  if (e.burn > 0) {
+    if (e.sub > 0.3) { e.burn = 0; e.fireCd = 150; if (inb(cxOf(e) | 0, e.y | 0)) addGas((e.y | 0) * W + (cxOf(e) | 0), ID.STEAM, 0.4); }
+    else {
+      e.burn -= e.lie ? 4 : 1;
+      if (e.burn <= 0) e.fireCd = 150;
+      e.char = Math.min(1, e.char + 0.0025);
+      lifeHurt(e, alive ? 0.2 : 0, 'burned');
+      const fx = Math.round(cxOf(e) - 0.5 + (Math.random() - 0.5) * bw(e)), fy = Math.round(e.y) - 1;
+      if (inb(fx, fy)) addHeatFlame(fy * W + fx, 850, 0.32, 0.03);
+      if (inb(fx, fy - 1)) addHeatFlame((fy - 1) * W + fx, 700, 0.12, 0.01);
+    }
+  }
+  e.bodyT += ((e.burn > 0 ? 300 : alive ? 37 : Math.min(37, e.airT)) - e.bodyT) * 0.01;
+  if (!alive) return;
+  // breath
+  if (e.headWet && !(e.lie && e.sub < 0.5)) { e.breath -= e.sp === HU ? 0.28 : 0.4; if (e.breath <= 0) { e.breath = 0; lifeHurt(e, 0.6, 'drowned'); } }
+  else e.breath = Math.min(100, e.breath + 1.5);
+  // warmth: cold air (or icy water) drains it, warm air near a fire brings it back
+  const T = e.airT;
+  if (T < S.cold) e.warm -= Math.min(1, (S.cold - T) * 0.0025);
+  else if (T > 26) e.warm += Math.min(0.6, (T - 26) * 0.01);
+  else e.warm += 0.01;
+  e.warm = Math.max(0, Math.min(100, e.warm));
+  if (e.warm < 8) lifeHurt(e, 0.04, 'froze');
+  // needs
+  const hum = e.sp === HU;
+  e.hunger = Math.min(100, e.hunger + (hum ? 0.0075 : e.sp === WOLF ? 0.006 : 0.005));
+  e.thirst = Math.min(100, e.thirst + (hum ? 0.011 : 0.007));
+  if (hum && !(e.task && e.task.k === 'rest')) e.energy = Math.max(0, e.energy - 0.004);
+  if (e.hunger >= 100) lifeHurt(e, 0.02, 'starved');
+  if (e.thirst >= 100) lifeHurt(e, 0.03, 'died of thirst');
+  if (e.hunger < 65 && e.thirst < 65 && e.warm > 30 && e.burn <= 0) e.hp = Math.min(S.hp, e.hp + 0.012);
+  if (Math.abs(e.want) > S.walk * 1.3) e.stam = Math.max(0, e.stam - (hum ? 0.12 : 0.22)); else e.stam = Math.min(100, e.stam + 0.12);
+}
+
+// ---------- movement ----------
+function lifePhysics(e, S) {
+  let w = bw(e), h = bh(e), ix = Math.round(e.x), iy = Math.round(e.y);
+  // something moved into the body (a falling block, a sand slide, growing plants): squeeze out of it, or get crushed
+  const ov = boxSolid(ix, iy, w, h);
+  if (ov) {
+    let ok = false;
+    for (let k = 1; k <= 4 && !ok; k++) {
+      if (!boxSolid(ix, iy - k, w, h)) { iy -= k; ok = true; }
+      else if (!boxSolid(ix - k, iy, w, h)) { ix -= k; ok = true; }
+      else if (!boxSolid(ix + k, iy, w, h)) { ix += k; ok = true; }
+    }
+    if (ok) { e.x = ix; e.y = iy; }
+    else {
+      if (!e.dead) lifeHurt(e, ov >= w * h * 0.35 ? 999 : 2 + ov * 1.5, 'crushed');
+      else if (ov >= w * h * 0.8) e.deadT += 20;          // buried: rots away soon
+      e.vx = 0; e.vy = 0; lifeSense(e, ix, iy, w, h); return;
+    }
+  }
+  lifeSense(e, ix, iy, w, h);
+  // air: a strong wind or blast wave pushes light bodies
+  const gi = Math.min(GX - 1, Math.max(0, (cxOf(e) / GS) | 0)), gj = Math.min(GY - 1, Math.max(0, (cyOf(e) / GS) | 0)), ac = gj * GX + gi;
+  const ax = AX[ac], ay = AY[ac];
+  if (ax * ax + ay * ay > 1.2) { const k = e.sp === RABBIT ? 0.05 : e.sp === DEER ? 0.012 : 0.025; e.vx += (ax - e.vx) * k; e.vy += ay * k * 0.5; }
+  // control
+  const ctl = e.dead ? 0 : 1;
+  if (e.sub > 0.25) {                                       // swimming
+    e.vx += (e.want * 0.6 * ctl - e.vx) * 0.12;
+    e.vy += LG - LG * 1.35 * Math.min(1, e.sub * 1.6);
+    if (!e.dead && e.headWet && e.lava === 0) e.vy -= 0.05;
+    e.vy *= 0.88;
+    if (e.sub > 0.25 && e.lava) { e.vx *= 0.6; e.vy *= 0.6; }   // lava is thick
+  } else {
+    if (e.ground && !e.flung) e.vx += (e.want * ctl - e.vx) * 0.35;
+    else if (!e.flung) e.vx += (e.want * ctl - e.vx) * 0.04;
+    e.vy += LG;
+  }
+  if (e.jumpReq && ctl && (e.ground || (e.sub > 0.2 && !e.headWet))) { e.vy = -S.jump; e.ground = false; }
+  e.jumpReq = false;
+  if (e.vy > 5) e.vy = 5;
+  if (e.vx > 6) e.vx = 6; else if (e.vx < -6) e.vx = -6;
+  // horizontal: pixel by pixel, stepping up small ledges
+  e.blocked = 0;
+  if (e.blkT > 0 && --e.blkT === 0) e.blk = 0;
+  if (e.vx !== 0) {
+    const nx = e.x + e.vx, tx = Math.round(nx);
+    let cx = ix, stepped = false;
+    while (cx !== tx) {
+      const s = tx > cx ? 1 : -1;
+      if (!boxSolid(cx + s, iy, w, h)) { cx += s; continue; }
+      let up = 0;
+      if ((e.ground || e.sub > 0.25) && !e.dead) for (let k = 1; k <= S.step; k++) if (!boxSolid(cx + s, iy - k, w, h)) { up = k; break; }
+      if (up) { cx += s; iy -= up; stepped = true; continue; }
+      e.blocked = s; break;
+    }
+    if (e.blocked) {
+      e.blk = e.blocked; e.blkT = 8;
+      if (e.flung && Math.abs(e.vx) > 3) lifeHurt(e, (Math.abs(e.vx) - 3) * 18, 'smashed into a wall');
+      e.x = cx; e.vx = 0;
+    } else e.x = nx;
+    ix = cx;
+    if (stepped) e.y = iy;
+  }
+  // vertical
+  const ny = e.y + e.vy, ty = Math.round(ny);
+  let cy = iy, hit = 0;
+  while (cy !== ty) {
+    const s = ty > cy ? 1 : -1;
+    if (!boxSolid(ix, cy + s, w, h)) { cy += s; continue; }
+    hit = s; break;
+  }
+  if (hit) {
+    if (hit > 0) {
+      const v = e.vy;
+      if (v > 3.1 && e.sub < 0.2) lifeHurt(e, (v - 3.1) * (e.sp === RABBIT ? 30 : 55), 'fell to death');
+      e.flung = false;
+    }
+    e.y = cy; e.vy = 0;
+  } else e.y = ny;
+  iy = cy;
+  e.ground = boxSolid(ix, iy + h, w, 1) > 0;
+  if (e.ground && e.vy >= 0) e.flung = false;
+  if (e.y > H + 20) { e.hp = 0; e.dead = true; e.deadT = 1e9; }
+}
+
+// ---------- looking around ----------
+function exposed(i, x, y) {
+  for (let q = 0; q < 4; q++) {
+    const ax = x + DX[q], ay = y + DY[q];
+    if (ay < 0) return true;
+    if (!inb(ax, ay)) continue;
+    const j = ay * W + ax;
+    if (type[j] === 0 && !lOcc[j]) return true;
+  }
+  return false;
+}
+function isBad(e, x, y) {
+  for (let k = e.bad.length - 1; k >= 0; k--) {
+    const b = e.bad[k];
+    if (frame > b.t) { e.bad.splice(k, 1); continue; }
+    if (Math.abs(b.x - x) < 8 && Math.abs(b.y - y) < 8) return true;
+  }
+  return false;
+}
+function markBad(e, x, y) { if (e.bad.length > 24) e.bad.shift(); e.bad.push({ x, y, t: frame + 1800 }); }
+function findCell(e, test, R, key) {
+  key = key || test.name;
+  if (e.miss && e.miss[key] > frame) return -1;
+  // nearest matching cell, widening the search; climbing up or down costs more than walking along
+  const cx = Math.round(cxOf(e)), cy = Math.round(cyOf(e));
+  let best = -1, bd = 1e9;
+  for (let r = 8; ; r *= 2) {
+    if (r > R) r = R;
+    const x0 = Math.max(0, cx - r), x1 = Math.min(W - 1, cx + r), y0 = Math.max(0, cy - r), y1 = Math.min(H - 1, cy + r), st = r > 40 ? 2 : 1;
+    for (let y = y0; y <= y1; y += st) {
+      const dy = (y - cy) * 2.2, dy2 = dy * dy;
+      if (dy2 >= bd) continue;
+      for (let x = x0; x <= x1; x += st) {
+        const dx = x - cx, d = dx * dx + dy2;
+        if (d >= bd) continue;
+        const i = y * W + x;
+        if (!test(i, x, y) || isBad(e, x, y)) continue;
+        bd = d; best = i;
+      }
+    }
+    if (best >= 0) return best;
+    if (r >= R) { (e.miss || (e.miss = {}))[key] = frame + 200 + ((Math.random() * 200) | 0); return -1; }
+  }
+}
+const isWoodAt = (i, x, y) => type[i] === ID.WOOD && life[i] === 0 && temp[i] < 80 && exposed(i, x, y) && !inSite(x, y);
+function inSite(x, y) { for (const f of FIRES) if (Math.abs(x - f.x) <= 6 && y <= f.y && y > f.y - 9) return true; return false; }
+const isPlantAt = (i, x, y) => type[i] === ID.PLANT && life[i] === 0 && temp[i] < 80 && exposed(i, x, y);
+const isStoneAt = (i, x, y) => (type[i] === ID.STONE || type[i] === ID.GRAVEL) && temp[i] < 80 && exposed(i, x, y);
+const isWaterAt = (i, x, y) => lOcc[i] > 0 && lKind[i] === 0 && temp[i] < 60 && y > 0 && type[i - W] === 0 && !lOcc[i - W];
+function isSoilAt(i, x, y) {
+  if (type[i] !== ID.DIRT || y < 1 || type[i - W] !== 0 || lOcc[i - W]) return false;
+  let wet = false;
+  for (let dy = -3; dy <= 4 && !wet; dy++) for (let dx = -10; dx <= 10; dx++) { const ax = x + dx, ay = y + dy; if (inb(ax, ay) && lOcc[ay * W + ax] && lKind[ay * W + ax] === 0) { wet = true; break; } }
+  if (!wet) return false;
+  for (let dx = -3; dx <= 3; dx++) { const ax = x + dx; if (ax >= 0 && ax < W && (type[i - W + dx] === ID.SEED || type[i - W + dx] === ID.PLANT)) return false; }
+  return true;
+}
+function nearest(e, pred, R) {
+  let best = null, bd = R * R;
+  const cx = cxOf(e), cy = cyOf(e);
+  for (const o of LIFE) {
+    if (o === e || !pred(o)) continue;
+    const dx = cxOf(o) - cx, dy = (cyOf(o) - cy) * 1.5, d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = o; }
+  }
+  return best;
+}
+function dist(a, b) { return Math.hypot(cxOf(a) - cxOf(b), cyOf(a) - cyOf(b)); }
+function clearLine(x0, y0, x1, y1) {
+  const n = Math.ceil(Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0)));
+  for (let s = 1; s < n; s++) { const x = Math.round(x0 + (x1 - x0) * s / n), y = Math.round(y0 + (y1 - y0) * s / n); if (inb(x, y) && type[y * W + x]) return false; }
+  return true;
+}
+// a fire site is checked a few times a second: is anything burning there, and how much fuel is left?
+function fireCheck(f) {
+  if (frame - f.chk < 15) return;
+  f.chk = frame;
+  let burning = 0, fuel = 0, flame = 0, wet = 0;
+  for (let y = f.y - 8; y < f.y + 1; y++) for (let x = f.x - 5; x <= f.x + 5; x++) {
+    if (!inb(x, y)) continue;
+    const c = y * W + x, t = type[c];
+    if (t && IGN[t] < 1e9) { fuel++; if (life[c] > 0) burning++; }
+    if (gF[c] > 0.2) flame++;
+    if (lOcc[c]) wet++;
+  }
+  f.burning = burning; f.fuel = fuel; f.lit = burning > 0 || flame > 3;
+  if (f.lit) f.idle = 0; else f.idle += 15;
+  if (wet > 12) f.idle += 300;
+}
+function nearFire(e, R) {
+  let best = null, bd = R;
+  for (const f of FIRES) {
+    fireCheck(f);
+    if (!f.lit) continue;
+    const d = Math.abs(f.x - cxOf(e)) + Math.abs(f.y - feetOf(e)) * 2;
+    if (d < bd) { bd = d; best = f; }
+  }
+  return best;
+}
+function fireSpot(e, x0) {
+  // a flat patch of ground with room above it and nothing flammable close by (no burning down the forest)
+  const fy = Math.round(feetOf(e));
+  for (let k = 0; k <= 60; k += 3) for (const s of [1, -1]) {
+    const sx = Math.round(x0 + k * s);
+    if (sx < 6 || sx > W - 7) continue;
+    let gy = -1;
+    for (let y = fy - 10; y < fy + 14; y++) { if (!inb(sx, y) || !inb(sx, y - 1)) continue; if (type[y * W + sx] && !type[(y - 1) * W + sx]) { gy = y; break; } }
+    if (gy < 8) continue;
+    let ok = true;
+    for (let x = sx - 2; x <= sx + 2 && ok; x++) {
+      const t = type[gy * W + x];
+      if (!t || IGN[t] < 1e9) ok = false;
+      for (let y = gy - 6; y < gy && ok; y++) if (type[y * W + x] || lOcc[y * W + x]) ok = false;
+    }
+    for (let y = gy - 14; y < gy + 2 && ok; y++) for (let x = sx - 8; x <= sx + 8; x++) { if (!inb(x, y)) continue; const t = type[y * W + x]; if (t && IGN[t] < 1e9 && t !== ID.COAL) { ok = false; break; } }
+    for (const f of FIRES) if (Math.abs(f.x - sx) < 12 && Math.abs(f.y - gy) < 10) ok = false;
+    if (ok) return { x: sx, y: gy };
+  }
+  return null;
+}
+function siteOf(x, y) { for (const f of FIRES) if (Math.abs(f.x - x) < 6 && Math.abs(f.y - y) < 6) return f; return null; }
+
+// ---------- walking somewhere ----------
+function setTask(e, k, o) {
+  e.task = Object.assign({ k, t: 0, n: 0, wait: 0, miss: 0 }, o || {});
+  e.bestD = 1e9; e.stuckT = 0; e.digT = 0;
+  if (e.lie && e.sp === HU && !e.dead && k !== 'rest' && k !== 'roll') setLie(e, false);
+  return true;
+}
+function deadlyAhead(e, ax, feet) {
+  if (ax < 1 || ax >= W - 1) return true;
+  const top = Math.round(e.y);
+  for (let y = top; y < feet; y++) {
+    if (!inb(ax, y)) continue;
+    const c = y * W + ax;
+    if (gF[c] > 0.3 || temp[c] > 120 || (life[c] > 0 && IGN[type[c]] < 1e9) || (lOcc[c] && (lKind[c] === 3 || lKind[c] === 2))) return true;
+  }
+  for (let y = feet; y < feet + 70; y++) {
+    if (y >= H) return y - feet > 48;
+    const c = y * W + ax;
+    if (lOcc[c]) return lKind[c] === 3 || lKind[c] === 2;
+    if (type[c]) return y - feet > (e.sp === RABBIT ? 30 : 48) || temp[c] > 200;
+  }
+  return true;
+}
+const DIGGABLE = new Uint8Array(DEFS.length);
+['DIRT', 'SAND', 'SNOW', 'GRAVEL', 'ASH', 'SAWDUST', 'CLAY', 'PLANT', 'SALT', 'CEMENT', 'SEED', 'SHARDS'].forEach(k => { DIGGABLE[ID[k]] = 1; });
+function steer(e, S, tx, near, run, brave) {
+  // 1 = arrived, 0 = on the way, -1 = can't get there
+  const cx = cxOf(e), dx = tx - cx;
+  if (Math.abs(dx) <= near) { e.want = 0; return 1; }
+  const s = dx > 0 ? 1 : -1;
+  e.dir = s;
+  let sp = run ? S.run : S.walk;
+  if (run && e.stam < 8) sp = S.walk * 1.25;
+  if (e.sub > 0.25) sp *= 0.8;
+  const feet = Math.round(feetOf(e));
+  if (!brave && e.ground && deadlyAhead(e, Math.round(cx + s * (bw(e) / 2 + 2)), feet)) { e.want = 0; return -1; }
+  e.want = s * sp;
+  if (e.blk === s) {
+    // something in the way: jump it if it's low enough; if that doesn't work, dig or cut through soft stuff
+    const ix = Math.round(e.x), iy = Math.round(e.y), w = bw(e), h = bh(e), fx = s > 0 ? ix + w : ix - 1;
+    let tall = 0;
+    for (let y = iy + h - 1; y >= iy - 8; y--) { if (inb(fx, y) && type[y * W + fx]) tall = iy + h - y; else if (y < iy + h - 1) break; }
+    e.digT++;
+    if (e.ground && e.digT < 40 && tall <= (S.jump * S.jump) / (2 * LG) - 1) e.jumpReq = true;
+    else if (e.sp === HU && e.digT % 8 === 0) {
+      let hard = false, dug = false;
+      for (let y = iy - 1; y < iy + h; y++) {
+        if (!inb(fx, y)) continue;
+        const c = y * W + fx, t = type[c];
+        if (!t) continue;
+        if (DIGGABLE[t] || t === ID.WOOD || (t === ID.STONE && e.task && e.task.k === 'mine')) {
+          type[c] = 0; life[c] = 0;
+          if (t === ID.GRAVEL || t === ID.STONE) e.stone++; else if (t === ID.WOOD) e.wood++; else if (t === ID.PLANT && Math.random() < 0.3) e.berries++;
+          e.act = 10; e.doing = t === ID.PLANT || t === ID.WOOD ? 'cutting a way through' : 'digging'; dug = true; break;
+        }
+        if (y < iy + h - S.step) hard = true;
+      }
+      if (!dug && hard) return -1;
+    }
+  } else if (e.digT && !e.blk) e.digT = Math.max(0, e.digT - 1);
+  const ad = Math.abs(dx);
+  if (ad < e.bestD - 1.5) { e.bestD = ad; e.stuckT = 0; } else if (++e.stuckT > 220) return -1;
+  return 0;
+}
+function inReach(e, x, y) {
+  const cx = cxOf(e), top = e.y, feet = feetOf(e), rw = bw(e) / 2 + 5;
+  return Math.abs(x + 0.5 - cx) <= rw && y >= top - 3 && y <= feet;
+}
+function reachCell(e, test) {
+  // the nearest matching cell within arm's reach
+  const cx = cxOf(e), x0 = Math.floor(cx - bw(e) / 2 - 6), x1 = Math.ceil(cx + bw(e) / 2 + 6), y0 = Math.floor(e.y) - 3, y1 = Math.floor(feetOf(e));
+  let best = -1, bd = 1e9;
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    if (!inb(x, y) || !inReach(e, x, y)) continue;
+    const i = y * W + x;
+    if (!test(i, x, y)) continue;
+    const d = Math.abs(x + 0.5 - cx) + Math.abs(y - cyOf(e)) * 0.5;
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+function wetReach(e) {
+  const ix = Math.round(e.x) - 3, iy = Math.round(e.y), w = bw(e) + 6, h = bh(e) + 3;
+  for (let y = iy; y < iy + h; y++) for (let x = ix; x < ix + w; x++) if (inb(x, y) && lOcc[y * W + x] && lKind[y * W + x] === 0) return y * W + x;
+  return -1;
+}
+function placeCell(x, y, t) {
+  if (!inb(x, y)) return false;
+  const c = y * W + x;
+  if (type[c] || lOcc[c]) return false;
+  setCell(c, t); grp[c] = 31000 + (treeN % 30000);
+  return true;
+}
+
+// ---------- spears ----------
+function throwSpear(e, tgt) {
+  const sx = cxOf(e) + e.dir * 2, sy = e.y + 2;
+  const tx = cxOf(tgt), ty = cyOf(tgt);
+  const v = 3.4, d = Math.abs(tx - sx), t0 = Math.max(4, d / v);
+  const lead = tgt.vx * t0, ax = tx + lead, t = Math.max(4, Math.abs(ax - sx) / v);
+  const vx = (ax - sx) / t, vy = (ty - sy - 0.5 * 0.1 * t * t) / t + (Math.random() - 0.5) * 0.12;
+  SPEARS.push({ x: sx, y: sy, vx, vy, fly: true, owner: e.id, t: 0, q: e.spear });
+  e.spear = false; e.act = 14; e.throwCd = 50;
+}
+function dropSpear(e) { SPEARS.push({ x: cxOf(e), y: e.y + 2, vx: 0, vy: 0, fly: false, owner: 0, t: 0, q: e.spear }); e.spear = false; }
+function spearStep() {
+  for (let k = SPEARS.length - 1; k >= 0; k--) {
+    const s = SPEARS[k];
+    s.t++;
+    if (s.fly) {
+      for (let sub = 0; sub < 4 && s.fly; sub++) {
+        s.x += s.vx / 4; s.y += s.vy / 4; s.vy += 0.1 / 4;
+        const x = Math.round(s.x), y = Math.round(s.y);
+        if (x < 0 || x >= W || y >= H) { s.fly = false; s.x = Math.max(1, Math.min(W - 2, s.x)); s.y = Math.min(H - 2, s.y); break; }
+        if (y >= 0 && type[y * W + x]) { s.fly = false; s.x -= s.vx / 4; s.y -= s.vy / 4; break; }
+        if (y >= 0 && lOcc[y * W + x]) { s.vx *= 0.9; s.vy *= 0.9; }
+        for (const o of LIFE) {
+          if (o.dead || o.id === s.owner || o.sp === HU) continue;
+          if (s.x >= o.x - 0.5 && s.x <= o.x + bw(o) + 0.5 && s.y >= o.y - 0.5 && s.y <= o.y + bh(o) + 0.5) {
+            lifeHurt(o, (s.q === 2 ? 50 : 36) + Math.random() * 12, 'speared'); o.vx += s.vx * 0.15;
+            if (o.sp === WOLF) { o.alarm = 120; o.foe = s.owner; }
+            s.fly = false; s.vx = 0; s.vy = 0; break;
+          }
+        }
+      }
+    } else {                                                    // a spear on the ground drops until it rests on something
+      const x = Math.round(s.x), y = Math.round(s.y) + 1;
+      if (y < H && !(inb(x, y) && type[y * W + x])) { s.y += 1; s.vy = 0; }
+    }
+    if (s.y > H + 5 || s.t > 20000) SPEARS.splice(k, 1);
+  }
+}
+
+// ---------- humans ----------
+const canCraft = e => (e.wood >= 6 && e.stone >= 3) || e.wood >= 8;
+function foodScore(e) { return e.cooked * 3 + e.berries + e.meat * 1.5; }
+function humanThink(e, S) {
+  const t = e.task;
+  // keep doing something that is going fine
+  if (t && t.k !== 'wander' && t.k !== 'idle' && t.k !== 'camp') return;
+  const hungry = e.hunger, cx = cxOf(e);
+  // a friend nearby is starving and I have plenty: share
+  if (foodScore(e) >= 4) {
+    const f = nearest(e, o => o.sp === HU && !o.dead && o.hunger > 70 && foodScore(o) < 1, 90);
+    if (f) return setTask(e, 'share', { o: f });
+  }
+  if (e.thirst > 55) { const w = findCell(e, isWaterAt, 260); if (w >= 0) return setTask(e, 'drink', { x: w % W, y: (w / W) | 0 }); }
+  if (hungry > 45) {
+    if (e.cooked || e.berries || (e.meat && hungry > 75)) return setTask(e, 'eat');
+    if (e.meat) {
+      const f = nearFire(e, 200); if (f) return setTask(e, 'cook', { f }); if (e.wood >= 8) return setTask(e, 'campfire');
+      const w = findCell(e, isWoodAt, 200); if (w >= 0) return setTask(e, 'chop', { x: w % W, y: (w / W) | 0 });     // firewood first, then cook
+    }
+    const carc = nearest(e, o => o.dead && o.sp !== HU && o.meatLeft > 0, 160);
+    if (carc) return setTask(e, 'butcher', { o: carc });
+    if (e.spear) { const p = huntTarget(e); if (p) return setTask(e, 'hunt', { o: p }); }
+    if (!e.spear && SPEARS.length) { const sp = spearNear(e, 200); if (sp) return setTask(e, 'fetch', { s: sp }); }
+    const pl = findCell(e, isPlantAt, 170);
+    if (pl >= 0) return setTask(e, 'forage', { x: pl % W, y: (pl / W) | 0 });
+    if (!e.spear && canCraft(e)) return setTask(e, 'craft');
+  }
+  // threats: a wolf nearby
+  const wolf = nearest(e, o => o.sp === WOLF && !o.dead, 90);
+  if (wolf) { if (e.spear || (e.hp > 60 && nearest(e, o => o.sp === HU && !o.dead && o.spear, 60))) return setTask(e, 'hunt', { o: wolf, defend: true }); }
+  if (e.meat) { const f = nearFire(e, 220); if (f) return setTask(e, 'cook', { f }); if (e.wood >= 8) return setTask(e, 'campfire'); }
+  if (e.warm < 55) { const f = nearFire(e, 220); if (f) return setTask(e, 'warm', { f }); if (e.wood >= 8) return setTask(e, 'campfire'); }
+  if (e.energy < 25) { const f = nearFire(e, 200); return setTask(e, 'rest', { f }); }
+  // the camp fire went out: rebuild or feed it
+  if (camp && e.wood >= 4 && Math.abs(camp.x - cx) < 260) {
+    fireCheck(camp);
+    if (!camp.lit) return setTask(e, camp.fuel >= 4 ? 'kindle' : (e.wood >= 8 ? 'campfire' : 'gatherwood'), { f: camp, x: camp.x, y: camp.y });
+    if (camp.burning < 3 && camp.lit) return setTask(e, 'feed', { f: camp });
+  }
+  if (!e.spear) {
+    if (SPEARS.length) { const sp = spearNear(e, 160); if (sp) return setTask(e, 'fetch', { s: sp }); }
+    if (canCraft(e)) return setTask(e, 'craft');
+    if (e.stone < 3 && e.wood >= 6) { const s = findCell(e, isStoneAt, 140, 'stone'); if (s >= 0) return setTask(e, 'mine', { x: s % W, y: (s / W) | 0 }); }
+    if (e.wood < 8) { const w = findCell(e, isWoodAt, 220); if (w >= 0) return setTask(e, 'chop', { x: w % W, y: (w / W) | 0 }); }
+  }
+  if (e.wood < 14) { const w = findCell(e, isWoodAt, 220); if (w >= 0) return setTask(e, 'chop', { x: w % W, y: (w / W) | 0 }); }
+  if (!camp && e.wood >= 8 && Math.random() < 0.5) return setTask(e, 'campfire');
+  if (e.spear && hungry > 20 && foodScore(e) < 3) { const p = huntTarget(e); if (p) return setTask(e, 'hunt', { o: p }); }
+  if (e.seeds > 0 && Math.random() < 0.5) { const s = findCell(e, isSoilAt, 120); if (s >= 0) return setTask(e, 'sow', { x: s % W, y: (s / W) | 0 }); }
+  if (e.berries < 3 && hungry > 15 && Math.random() < 0.4) { const pl = findCell(e, isPlantAt, 120); if (pl >= 0) return setTask(e, 'forage', { x: pl % W, y: (pl / W) | 0 }); }
+  if (e.stone < 6 && Math.random() < 0.25) { const s = findCell(e, isStoneAt, 120); if (s >= 0) return setTask(e, 'mine', { x: s % W, y: (s / W) | 0 }); }
+  if (t && (t.k === 'wander' || t.k === 'camp' || t.k === 'idle')) return;
+  if (camp && Math.abs(camp.x - cx) > 30 && Math.abs(camp.x - cx) < 320) return setTask(e, 'camp', { x: camp.x + (Math.random() - 0.5) * 30 });
+  return setTask(e, 'wander', { x: Math.max(4, Math.min(W - 4, cx + (Math.random() - 0.5) * 120)) });
+}
+function spearNear(e, R) {
+  let best = null, bd = R;
+  for (const s of SPEARS) { if (s.fly || s.bad > frame) continue; const d = Math.abs(s.x - cxOf(e)) + Math.abs(s.y - cyOf(e)); if (d < bd) { bd = d; best = s; } }
+  return best;
+}
+function huntTarget(e) {
+  // prefer what a friend is already hunting (they team up), then the easiest catch close by
+  let best = null, bs = -1e9;
+  for (const o of LIFE) {
+    if (o.dead || (o.sp !== DEER && o.sp !== RABBIT)) continue;
+    const d = dist(e, o);
+    if (d > SPECIES[HU].sight) continue;
+    let sc = -d + (o.sp === DEER ? 30 : 0) - o.hp * 0.3;
+    for (const f of LIFE) if (f !== e && f.sp === HU && f.task && f.task.k === 'hunt' && f.task.o === o) sc += 60;
+    if (sc > bs) { bs = sc; best = o; }
+  }
+  return best;
+}
+function humanTask(e, S) {
+  const t = e.task;
+  t.t++;
+  const fail = () => { if (t.x !== undefined) markBad(e, t.x, t.y); e.task = null; e.think = 0; };
+  switch (t.k) {
+    case 'wander': case 'camp': {
+      e.doing = t.k === 'camp' ? 'hanging around camp' : 'wandering';
+      if (t.wait) { e.want = 0; if (--t.wait <= 0) e.task = null; break; }
+      const r = steer(e, S, t.x, 2, false);
+      if (r) t.wait = 60 + Math.random() * 200;
+      break;
+    }
+    case 'drink': {
+      e.doing = 'drinking';
+      const near = wetReach(e);
+      if (near >= 0) {
+        e.want = 0; e.thirst -= 0.5; if (t.t % 50 === 0) consumeReq[near] = 1;
+        if (e.thirst <= 2) { e.thirst = 0; e.task = null; }
+        break;
+      }
+      if (steer(e, S, t.x + 0.5, 1, e.thirst > 85) < 0) fail();
+      if (t.t > 1500) fail();
+      break;
+    }
+    case 'chop': case 'mine': case 'forage': {
+      const test = t.k === 'chop' ? isWoodAt : t.k === 'mine' ? isStoneAt : isPlantAt;
+      e.doing = t.k === 'chop' ? 'chopping wood' : t.k === 'mine' ? 'mining stone' : 'picking plants';
+      const c = reachCell(e, test);
+      if (c >= 0) {
+        e.want = 0; e.dir = (c % W) + 0.5 > cxOf(e) ? 1 : -1; e.act = 6;
+        if (t.t % (t.k === 'mine' ? 16 : t.k === 'chop' ? 11 : 9) === 0) {
+          const x = c % W, y = (c / W) | 0, tp = type[c];
+          type[c] = 0; life[c] = 0; temp[c] = AMBIENT;
+          if (tp === ID.WOOD) { e.wood++; if (Math.random() < 0.35) addGrain(ID.SAWDUST, x + 0.5, y + 0.5, -e.dir * 0.3 * Math.random(), -0.3 - Math.random() * 0.3); }
+          else if (tp === ID.PLANT) {
+            if (Math.random() < 0.5) e.berries++;
+            if (Math.random() < 0.15) e.seeds++;
+            if (Math.random() < 0.25) e.wood++;
+          } else { e.stone++; if (Math.random() < 0.3) addGrain(ID.GRAVEL, x + 0.5, y + 0.5, -e.dir * 0.3, -0.4); }
+          t.n++;
+          if ((t.k === 'chop' && e.wood >= 24) || (t.k === 'mine' && e.stone >= 12) || (t.k === 'forage' && (e.berries >= 6 || t.n > 20))) e.task = null;
+        }
+        t.miss = 0; break;
+      }
+      if (t.n > 0 && ++t.miss > 20) { e.task = null; break; }           // cleared everything in reach: look again
+      if (!test(t.y * W + t.x, t.x, t.y)) { if (t.n > 0) e.task = null; else { e.task = null; e.think = 0; } break; }
+      const r = steer(e, S, t.x + 0.5, 2.5 + bw(e) / 2, false);
+      if (r < 0 || (r === 1 && ++t.wait > 60) || t.t > 1800) fail();
+      break;
+    }
+    case 'eat': {
+      e.doing = 'eating'; e.want = 0; e.act = 4;
+      if (t.t < 40) break;
+      if (e.cooked) { e.cooked--; e.hunger -= 45; e.hp = Math.min(S.hp, e.hp + 10); }
+      else if (e.berries) { e.berries--; e.hunger -= 12; }
+      else if (e.meat) { e.meat--; e.hunger -= 18; if (Math.random() < 0.3) lifeHurt(e, 8, 'food poisoning'); }
+      e.hunger = Math.max(0, e.hunger);
+      if (e.hunger > 25 && (e.cooked || e.berries || (e.meat && e.hunger > 75))) t.t = 0; else e.task = null;
+      break;
+    }
+    case 'share': {
+      const o = t.o;
+      if (!o || o.dead || foodScore(e) < 2) { e.task = null; break; }
+      e.doing = 'bringing food to ' + o.name;
+      if (dist(e, o) < 8) {
+        if (e.cooked) { e.cooked--; o.cooked++; } else if (e.meat) { e.meat--; o.meat++; } else if (e.berries) { e.berries -= 2; o.berries += 2; }
+        o.iconT = 90; o.icon = 1; e.iconT = 90; e.icon = 1; e.task = null; if (!o.task || o.task.k !== 'eat') setTask(o, 'eat'); break;
+      }
+      if (steer(e, S, cxOf(o), 3, true) < 0 || t.t > 1200) e.task = null;
+      break;
+    }
+    case 'craft': {
+      e.doing = e.stone >= 3 ? 'making a stone spear' : 'carving a wooden spear'; e.want = 0; e.act = 3;
+      if (t.t > 120) { if (e.wood >= 6 && e.stone >= 3) { e.wood -= 6; e.stone -= 3; e.spear = 2; } else if (e.wood >= 8) { e.wood -= 8; e.spear = 1; } e.task = null; }
+      break;
+    }
+    case 'fetch': {
+      const s = t.s;
+      if (!s || SPEARS.indexOf(s) < 0 || e.spear) { e.task = null; break; }
+      e.doing = 'picking up a spear';
+      if (s.fly) { e.want = 0; break; }
+      const sxi = Math.round(s.x), syi = Math.round(s.y), sunk = inb(sxi, syi) && lOcc[syi * W + sxi] > 0;
+      if (Math.abs(s.x - cxOf(e)) < 3 && Math.abs(s.y - cyOf(e)) < (sunk ? 24 : 9)) { SPEARS.splice(SPEARS.indexOf(s), 1); e.spear = s.q || 1; e.task = null; e.think = 0; break; }
+      const r = steer(e, S, s.x, 1, true);
+      if (r < 0 || (r === 1 && ++t.wait > 80) || t.t > 1500) { s.bad = frame + 3000; e.task = null; e.think = 0; }
+      break;
+    }
+    case 'hunt': {
+      const o = t.o;
+      if (!o || LIFE.indexOf(o) < 0) { e.task = null; break; }
+      if (o.dead) { if (o.sp === WOLF && t.defend) { e.task = null; break; } setTask(e, 'butcher', { o }); break; }
+      const d = dist(e, o), dx = cxOf(o) - cxOf(e), dy = cyOf(o) - cyOf(e);
+      e.doing = (t.defend ? 'fighting a ' : 'hunting a ') + SPECIES[o.sp].n.toLowerCase();
+      if (d > S.sight * 1.4 || t.t > 3000) { e.task = null; break; }
+      if (!e.spear && o.sp !== WOLF) {
+        const sp = spearNear(e, 140);
+        if (sp) { setTask(e, 'fetch', { s: sp }); break; }
+        e.task = null; break;
+      }
+      e.throwCd--; e.hitCd--;
+      if (d < 6) {
+        e.want = 0; e.dir = dx > 0 ? 1 : -1;
+        if (e.hitCd <= 0) { e.hitCd = 26; e.act = 10; lifeHurt(o, e.spear ? 22 + e.spear * 6 : 7, e.spear ? 'speared' : 'beaten'); if (o.sp === WOLF) o.foe = e.id; }
+        break;
+      }
+      if (e.spear && e.throwCd <= 0 && d > 12 && d < 88 && Math.abs(dy) < 30 && clearLine(cxOf(e), e.y + 2, cxOf(o), cyOf(o))) {
+        e.dir = dx > 0 ? 1 : -1; e.want = 0;
+        if (!t.aim) t.aim = 1;
+        if (++t.aim > 14) { throwSpear(e, o); t.aim = 0; }
+        e.doing = 'throwing a spear';
+        break;
+      }
+      t.aim = 0;
+      // sneak up on prey that hasn't noticed yet, run once it bolts
+      const r = steer(e, S, cxOf(o), 4, o.alarm > 0 || d < 30 || o.sp === WOLF, false);
+      if (r < 0) { e.task = null; markBad(e, cxOf(o) | 0, cyOf(o) | 0); }
+      break;
+    }
+    case 'butcher': {
+      const o = t.o;
+      if (!o || LIFE.indexOf(o) < 0 || o.meatLeft <= 0) { e.task = null; break; }
+      e.doing = 'butchering a ' + SPECIES[o.sp].n.toLowerCase();
+      if (Math.abs(cxOf(o) - cxOf(e)) < bw(o) / 2 + 3 && Math.abs(feetOf(o) - feetOf(e)) < 8) {
+        e.want = 0; e.act = 5; e.dir = cxOf(o) > cxOf(e) ? 1 : -1;
+        if (t.t % 45 === 0) { o.meatLeft--; e.meat++; bleed(cxOf(o), o.y + 1, 2); if (o.meatLeft <= 0) { o.deadT = 1e9; e.task = null; } }
+        break;
+      }
+      if (steer(e, S, cxOf(o), bw(o) / 2 + 2, false) < 0 || t.t > 1500) { e.task = null; }
+      break;
+    }
+    case 'campfire': {
+      // pick a safe spot (at camp if there is one), walk there, stack the logs, then light them
+      if (e.wood < 8 && !t.f) { e.task = null; break; }
+      e.doing = 'building a campfire';
+      if (!t.spot) {
+        if (camp) fireCheck(camp);
+        t.spot = (camp && Math.abs(camp.x - cxOf(e)) < 200 && !camp.lit && camp.fuel === 0) ? { x: camp.x, y: camp.y } : fireSpot(e, cxOf(e) + e.dir * 10);
+        if (!t.spot) { e.task = null; e.doing = 'no safe place for a fire'; break; }
+        t.side = cxOf(e) < t.spot.x ? -1 : 1;
+      }
+      const sx = t.spot.x, gy = t.spot.y;
+      const r = steer(e, S, sx + t.side * 7, 1.5, false);
+      if (r < 0 || t.t > 2000) { markBad(e, sx, gy); e.task = null; break; }
+      if (r === 1 && Math.abs(feetOf(e) - gy) < 6) {
+        e.want = 0; e.dir = -t.side; e.act = 6;
+        if (!t.f) {                                               // claim the spot: from now on these logs are the fire's
+          t.f = siteOf(sx, gy);
+          if (!t.f) { t.f = { x: sx, y: gy, lit: false, chk: -99, idle: 0, burning: 0, fuel: 0 }; FIRES.push(t.f); if (!camp || LIFE.every(o => o.sp !== HU || o.dead || Math.abs(camp.x - cxOf(o)) > 260)) camp = t.f; }
+        }
+        if (t.t % 6 === 0) {
+          const cells = [[0, 1], [-1, 1], [1, 1], [-2, 1], [2, 1], [0, 2], [-1, 2], [1, 2]];
+          let placed = false;
+          if (e.wood > 0) for (const [ox, oy] of cells) if (placeCell(sx + ox, gy - oy, ID.WOOD)) { e.wood--; placed = true; break; }
+          if (!placed) setTask(e, 'kindle', { f: t.f, x: sx, y: gy });
+        }
+      }
+      break;
+    }
+    case 'kindle': {
+      const f = t.f;
+      e.doing = 'lighting the fire';
+      const r = steer(e, S, f.x + (cxOf(e) < f.x ? -6 : 6), 2, false);
+      if (r < 0 || t.t > 1500) { e.task = null; break; }
+      if (r !== 1) break;
+      e.want = 0; e.dir = f.x > cxOf(e) ? 1 : -1; e.act = 3; t.n++;
+      if (t.n % 9 === 0 && inb(f.x, f.y - 1)) { const c = (f.y - 1) * W + f.x + ((Math.random() * 3) | 0) - 1; if (!type[c]) addHeatFlame(c, 500, 0.05, 0.01); }   // sparks
+      if (t.n > 100) {
+        let lit = 0;
+        for (let y = f.y - 3; y < f.y; y++) for (let x = f.x - 2; x <= f.x + 2; x++) { if (!inb(x, y)) continue; const c = y * W + x; if (type[c] && IGN[type[c]] < 1e9 && exposed(c, x, y) && Math.random() < 0.5) { ignite(c); lit += life[c] > 0 ? 1 : 0; } }
+        f.chk = -99;
+        if (lit || t.n > 400) e.task = null;
+        else if (t.n > 300 && f.fuel === 0) e.task = null;
+      }
+      break;
+    }
+    case 'feed': {
+      const f = t.f;
+      fireCheck(f);
+      if (e.wood < 2 || !f.lit) { e.task = null; break; }
+      e.doing = 'feeding the fire';
+      const r = steer(e, S, f.x + (cxOf(e) < f.x ? -6 : 6), 2, false);
+      if (r < 0 || t.t > 1200) { e.task = null; break; }
+      if (r !== 1) break;
+      e.want = 0; e.dir = f.x > cxOf(e) ? 1 : -1; e.act = 6;
+      if (t.t % 10 === 0) {
+        let ok = false;
+        for (let k = 0; k < 20 && !ok; k++) { const x = f.x + ((Math.random() * 5) | 0) - 2, y = f.y - 1 - ((Math.random() * 3) | 0); if (inb(x, y + 1) && type[(y + 1) * W + x] && placeCell(x, y, ID.WOOD)) ok = true; }
+        if (ok) e.wood--;
+        if (++t.n >= 4 || !ok) { f.chk = -99; e.task = null; }
+      }
+      break;
+    }
+    case 'gatherwood': { const w = findCell(e, isWoodAt, 220); if (w >= 0) setTask(e, 'chop', { x: w % W, y: (w / W) | 0 }); else e.task = null; break; }
+    case 'cook': case 'warm': case 'rest': {
+      const f = t.f;
+      if (f) fireCheck(f);
+      if (t.k !== 'rest' && (!f || !f.lit)) { e.task = null; break; }
+      e.doing = t.k === 'cook' ? 'cooking meat' : t.k === 'warm' ? 'warming up by the fire' : f && f.lit ? 'resting by the fire' : 'sleeping';
+      if (f && f.lit) {
+        if (!t.side) t.side = cxOf(e) < f.x ? -1 : 1;
+        const r = steer(e, S, f.x + t.side * (6 + (e.id % 4)), 1.5, false);
+        if (r < 0) { t.side = -t.side; if (++t.n > 3) { e.task = null; } break; }
+        if (r !== 1) break;
+        e.dir = f.x > cxOf(e) ? 1 : -1;
+        if (f.burning < 3 && e.wood >= 2 && t.t % 200 === 0) { setTask(e, 'feed', { f }); break; }
+      }
+      e.want = 0;
+      if (t.k === 'cook') {
+        e.act = 2;
+        if (t.t % 180 === 0) { if (e.meat) { e.meat--; e.cooked++; } if (!e.meat) { e.task = null; if (e.hunger > 35) setTask(e, 'eat'); } }
+      } else if (t.k === 'warm') { if (e.warm > 95 || t.t > 2400) e.task = null; }
+      else {
+        if (!e.lie && e.ground) setLie(e, true);
+        e.energy += 0.05;
+        if (e.energy >= 100 || e.hunger > 75 || e.thirst > 75) { e.energy = Math.min(100, e.energy); setLie(e, false); e.task = null; }
+      }
+      break;
+    }
+    case 'sow': {
+      if (e.seeds <= 0) { e.task = null; break; }
+      e.doing = 'planting seeds';
+      const r = steer(e, S, t.x + 0.5, 2.5, false);
+      if (r < 0 || t.t > 1500) { fail(); break; }
+      if (r !== 1) break;
+      e.want = 0; e.act = 4;
+      if (t.t % 30 === 0) {
+        const c = reachCell(e, isSoilAt);
+        if (c >= 0 && placeCell(c % W, ((c / W) | 0) - 1, ID.SEED)) e.seeds--;
+        else e.task = null;
+      }
+      break;
+    }
+    case 'flee': {
+      e.doing = t.why || 'running away!';
+      steer(e, S, t.x, 2, true, true);
+      if (t.t > (t.dur || 70)) e.task = null;
+      break;
+    }
+    case 'onfire': {
+      // on fire: run to water if it's close, otherwise stop, drop and roll
+      if (e.burn <= 0) { setLie(e, false); e.task = null; break; }
+      if (t.x !== undefined) { e.doing = 'on fire! running to water'; if (steer(e, S, t.x + 0.5, 1, true, true) !== 0 || e.sub > 0.3) t.x = undefined; break; }
+      e.doing = 'rolling to put out the flames';
+      e.want = 0;
+      if (!e.lie) setLie(e, true);
+      if (e.lie) e.roll = (e.roll || 0) + 1;
+      break;
+    }
+    default: e.task = null;
+  }
+}
+function feelDanger(e) {
+  // the hottest nearby spot: flames, glowing lava, burning fuel. Returns how much to worry and where it is
+  const cx = Math.round(cxOf(e)), cy = Math.round(cyOf(e)), hh = bh(e) / 2 + 6;
+  let wx = 0, wy = 0, n = 0;
+  const known = e.sp === HU ? FIRES.filter(f => Math.abs(f.x - cx) < 24 && Math.abs(f.y - cy) < 30) : [];
+  for (let dy = -hh; dy <= hh; dy += 2) for (let dx = -10; dx <= 10; dx += 2) {
+    const x = cx + dx, y = cy + dy;
+    if (!inb(x, y)) continue;
+    if (known.length && known.some(f => Math.abs(x - f.x) <= 4 && y < f.y && y > f.y - 22)) continue;
+    const c = y * W + x;
+    if (gF[c] > 0.35 || temp[c] > 140 || (lOcc[c] && lKind[c] === 3)) { wx += dx; wy += dy; n++; }
+  }
+  return n >= 3 ? { x: wx / n, n } : null;
+}
+function humanTick(e, S) {
+  if (e.burn > 0 && (!e.task || (e.task.k !== 'onfire'))) {
+    const w = findCell(e, isWaterAt, 50, 'firewater');
+    setTask(e, 'onfire', w >= 0 ? { x: w % W, y: (w / W) | 0 } : {});
+    e.iconT = 60; e.icon = 2;
+  }
+  if ((frame + e.id) % 6 === 0 && (!e.task || (e.task.k !== 'onfire' && e.task.k !== 'flee'))) {
+    const d = feelDanger(e);
+    if (d) { setTask(e, 'flee', { x: cxOf(e) - Math.sign(d.x || e.dir) * 60, why: 'running from the heat!' }); e.iconT = 50; e.icon = 2; }
+    else {
+      const wolf = nearest(e, o => o.sp === WOLF && !o.dead && o.task && o.task.k === 'hunt' && o.task.o === e, 70);
+      if (wolf && !e.spear) { setTask(e, 'flee', { x: cxOf(e) + (cxOf(e) < cxOf(wolf) ? -90 : 90), why: 'running from a wolf!', dur: 120 }); e.iconT = 50; e.icon = 2; }
+      else if (wolf && e.spear && (!e.task || e.task.k !== 'hunt')) setTask(e, 'hunt', { o: wolf, defend: true });
+    }
+  }
+  if (--e.think <= 0) { e.think = 20 + ((Math.random() * 20) | 0); humanThink(e, S); }
+  if (e.task) humanTask(e, S); else { e.want = 0; e.doing = 'thinking'; }
+}
+
+// ---------- animals ----------
+function animalTick(e, S) {
+  const t = e.task;
+  if (e.alarm > 0) e.alarm--;
+  if (e.burn > 0 && (!t || t.k !== 'flee')) setTask(e, 'flee', { x: cxOf(e) + (Math.random() < 0.5 ? -80 : 80), dur: 100 });
+  // prey watches for hunters and wolves; everything keeps away from fire
+  if ((frame + e.id) % 5 === 0) {
+    const d = feelDanger(e);
+    if (d) { setTask(e, 'flee', { x: cxOf(e) - Math.sign(d.x || e.dir) * 70, dur: 60 }); }
+    else if (e.sp !== WOLF) {
+      const fear = e.sp === DEER ? 52 : 40;
+      const R = e.alarm > 0 ? fear * 1.6 : fear;
+      const th2 = nearest(e, o => {
+        if (o.dead) return false;
+        const d = dist(e, o);
+        if (o.sp === WOLF) return d < R * 1.7;
+        if (o.sp !== HU || o.lie) return false;
+        return d < R;
+      }, R * 1.8);
+      if (th2) { e.alarm = Math.max(e.alarm, 90); setTask(e, 'flee', { x: cxOf(e) + (cxOf(e) < cxOf(th2) ? -100 : 100), dur: 50 }); }
+    } else {
+      // wolves won't go near a burning campfire
+      for (const f of FIRES) { if (!f.lit) continue; if (Math.abs(f.x - cxOf(e)) < 36 && Math.abs(f.y - feetOf(e)) < 30) { setTask(e, 'flee', { x: cxOf(e) + (cxOf(e) < f.x ? -70 : 70), dur: 60 }); break; } }
+      if (e.foe && e.alarm > 0 && e.hp < 30) setTask(e, 'flee', { x: cxOf(e) + (Math.random() < 0.5 ? -100 : 100), dur: 120 });
+    }
+  }
+  if (--e.think <= 0 || !e.task) { e.think = 25 + ((Math.random() * 20) | 0); animalThink(e, S); }
+  const k = e.task;
+  if (!k) { e.want = 0; return; }
+  k.t++;
+  switch (k.k) {
+    case 'flee': e.doing = 'fleeing'; if (steer(e, S, k.x, 2, true, true) !== 0 || k.t > (k.dur || 60)) e.task = null; break;
+    case 'wander': {
+      e.doing = 'roaming';
+      if (k.wait) { e.want = 0; if (--k.wait <= 0) e.task = null; break; }
+      const r = steer(e, S, k.x, 2, false);
+      if (r) k.wait = 40 + Math.random() * 160;
+      if (e.sp === RABBIT && e.ground && Math.random() < 0.02 && r === 0) e.jumpReq = true;
+      break;
+    }
+    case 'graze': {
+      e.doing = 'grazing';
+      const c = reachCell(e, isPlantAt);
+      if (c >= 0) { e.want = 0; e.act = 3; e.dir = (c % W) > cxOf(e) ? 1 : -1; if (k.t % 50 === 0) { type[c] = 0; life[c] = 0; e.hunger = Math.max(0, e.hunger - 18); if (e.hunger < 5) e.task = null; } break; }
+      if (!isPlantAt(k.y * W + k.x, k.x, k.y)) { e.task = null; break; }
+      const r = steer(e, S, k.x + 0.5, bw(e) / 2 + 2, false);
+      if (r < 0 || (r === 1 && ++k.wait > 50) || k.t > 1500) { markBad(e, k.x, k.y); e.task = null; }
+      break;
+    }
+    case 'drink': {
+      e.doing = 'drinking';
+      if (wetReach(e) >= 0) { e.want = 0; e.thirst -= 0.6; if (e.thirst <= 2) { e.thirst = 0; e.task = null; } break; }
+      const r = steer(e, S, k.x + 0.5, 1, false);
+      if (r < 0 || k.t > 1500) { markBad(e, k.x, k.y); e.task = null; }
+      break;
+    }
+    case 'herd': { e.doing = 'following the herd'; if (steer(e, S, k.x, 6, false) !== 0 || k.t > 600) e.task = null; break; }
+    case 'hunt': {
+      const o = k.o;
+      if (!o || LIFE.indexOf(o) < 0) { e.task = null; break; }
+      if (o.dead) { setTask(e, 'eat', { o }); break; }
+      e.doing = 'hunting a ' + SPECIES[o.sp].n.toLowerCase();
+      if (dist(e, o) > S.sight * 1.3 || k.t > 2500) { e.task = null; break; }
+      e.hitCd--;
+      if (Math.abs(cxOf(o) - cxOf(e)) < bw(e) / 2 + bw(o) / 2 + 1 && Math.abs(cyOf(o) - cyOf(e)) < 8) {
+        e.want = 0; e.dir = cxOf(o) > cxOf(e) ? 1 : -1;
+        if (e.hitCd <= 0) { e.hitCd = 28; e.act = 8; lifeHurt(o, 12 + Math.random() * 8, 'mauled by a wolf'); if (o.sp !== HU) o.alarm = 200; }
+        break;
+      }
+      if (e.ground && Math.abs(cxOf(o) - cxOf(e)) < 16 && cyOf(o) < cyOf(e) - 3) e.jumpReq = true;
+      if (steer(e, S, cxOf(o), 1, true) < 0) { markBad(e, cxOf(o) | 0, cyOf(o) | 0); e.task = null; }
+      break;
+    }
+    case 'eat': {
+      const o = k.o;
+      if (!o || LIFE.indexOf(o) < 0 || o.meatLeft <= 0 && o.sp !== HU) { e.task = null; break; }
+      e.doing = 'eating';
+      if (Math.abs(cxOf(o) - cxOf(e)) < bw(o) / 2 + bw(e) / 2 + 1) {
+        e.want = 0; e.act = 4;
+        if (k.t % 60 === 0) { e.hunger = Math.max(0, e.hunger - 25); o.meatLeft--; bleed(cxOf(o), o.y + 1, 1); if (o.meatLeft <= 0) { if (o.sp !== HU) o.deadT = 1e9; e.task = null; } if (e.hunger < 5) e.task = null; }
+        break;
+      }
+      if (steer(e, S, cxOf(o), 2, false) < 0 || k.t > 1500) e.task = null;
+      break;
+    }
+    case 'rest': e.doing = 'resting'; e.want = 0; if (k.t > 300) e.task = null; break;
+    default: e.task = null;
+  }
+}
+function animalThink(e, S) {
+  const t = e.task;
+  if (t && t.k !== 'wander' && t.k !== 'rest' && t.k !== 'herd') return;
+  if (e.thirst > 60) { const w = findCell(e, isWaterAt, 200); if (w >= 0) return setTask(e, 'drink', { x: w % W, y: (w / W) | 0 }); }
+  if (e.sp === WOLF) {
+    if (e.hunger > 40) {
+      const carc = nearest(e, o => o.dead && o.meatLeft > 0, 180);
+      if (carc) return setTask(e, 'eat', { o: carc });
+      const prey = nearest(e, o => !o.dead && (o.sp === RABBIT || o.sp === DEER || (o.sp === HU && (e.hunger > 75 || !o.spear) && !nearFire(o, 40))), S.sight);
+      if (prey) {
+        setTask(e, 'hunt', { o: prey });
+        for (const p of LIFE) if (p !== e && p.sp === WOLF && !p.dead && dist(p, e) < 80 && (!p.task || p.task.k === 'wander' || p.task.k === 'herd')) setTask(p, 'hunt', { o: prey });   // the pack joins in
+        return;
+      }
+    }
+  } else if (e.hunger > 30) {
+    const pl = findCell(e, isPlantAt, S.sight);
+    if (pl >= 0) return setTask(e, 'graze', { x: pl % W, y: (pl / W) | 0 });
+  }
+  // breed when well fed (only up to a limit)
+  if (e.age > 3000 && e.hunger < 40 && e.thirst < 55 && L_COUNT[e.sp] < S.cap && Math.random() < (e.sp === RABBIT ? 0.012 : 0.004)) {
+    const mate = nearest(e, o => o.sp === e.sp && !o.dead && o.age > 3000, 40);
+    if (mate && LIFE.length < LIFE_MAX) { const b = lifeNew(e.sp, e.x, e.y); b.hunger = 40; b.age = 0; LIFE.push(b); L_COUNT[e.sp]++; e.hunger += 25; }
+  }
+  // stay with the herd / pack
+  if (t && t.k === 'wander') return;
+  let n = 0, sx = 0;
+  for (const o of LIFE) if (o !== e && o.sp === e.sp && !o.dead && Math.abs(cxOf(o) - cxOf(e)) < 160) { n++; sx += cxOf(o); }
+  if (n && Math.abs(sx / n - cxOf(e)) > 45) return setTask(e, 'herd', { x: sx / n });
+  if (Math.random() < 0.25) return setTask(e, 'rest');
+  return setTask(e, 'wander', { x: Math.max(4, Math.min(W - 4, cxOf(e) + (Math.random() - 0.5) * 100)) });
+}
+
+// ---------- the world tick ----------
+function lifeStep() {
+  if (!LIFE.length && !SPEARS.length && !BLOOD.length) return;
+  L_COUNT.fill(0);
+  for (const e of LIFE) if (!e.dead) L_COUNT[e.sp]++;
+  for (let k = LIFE.length - 1; k >= 0; k--) {
+    const e = LIFE[k], S = SPECIES[e.sp];
+    e.age++; e.anim++;
+    if (e.act > 0) e.act--;
+    if (e.hurtT > 0) e.hurtT--;
+    if (e.iconT > 0) e.iconT--;
+    if (!e.dead) { if (e.sp === HU) humanTick(e, S); else animalTick(e, S); }
+    else { e.want = 0; e.deadT++; }
+    lifePhysics(e, S);
+    lifeBody(e, S);
+    if (e.dead && (e.deadT > (e.sp === HU ? 6000 : 4500) || (e.char >= 1 && e.deadT > 600))) {
+      if (e.char >= 0.6 && e.deadT < 1e8) { const x = Math.round(cxOf(e)), y = Math.round(feetOf(e)) - 1; if (inb(x, y) && !type[y * W + x]) addGrain(ID.ASH, x + 0.5, y + 0.5, 0, 0); }
+      LIFE.splice(k, 1);
+    }
+  }
+  spearStep();
+  for (const f of FIRES) fireCheck(f);
+  for (let k = FIRES.length - 1; k >= 0; k--) if (FIRES[k].idle > 3000 && FIRES[k].fuel === 0) { if (camp === FIRES[k]) camp = null; FIRES.splice(k, 1); }
+  for (let k = BLOOD.length - 1; k >= 0; k--) {
+    const b = BLOOD[k];
+    b.t++;
+    if (b.stuck >= 0) { if (!type[b.stuck] || b.t > 2400) BLOOD.splice(k, 1); continue; }
+    b.vy += 0.1; b.x += b.vx; b.y += b.vy;
+    const x = Math.round(b.x), y = Math.round(b.y);
+    if (!inb(x, y) || b.t > 400) { BLOOD.splice(k, 1); continue; }
+    if (lOcc[y * W + x]) { BLOOD.splice(k, 1); continue; }
+    if (type[y * W + x]) b.stuck = y * W + x;
+  }
+}
+function lifeBlast(x, y, power, R) {
+  for (const e of LIFE) {
+    const dx = cxOf(e) - x, dy = cyOf(e) - y, d = Math.hypot(dx, dy) || 1, reach = R * 3;
+    if (d > reach) continue;
+    const k = power * 1.1 * (1 - d / reach);
+    e.vx += dx / d * k; e.vy += dy / d * k - k * 0.6; e.flung = true; e.ground = false;
+    if (e.lie && !e.dead) setLie(e, false);
+    lifeHurt(e, power * 20 * (1 - d / reach) * (d < R ? 2 : 1), 'blown up');
+    if (d < R * 1.3) e.burn = Math.max(e.burn, 200);
+  }
+}
+function lifeErase(x, y, r) {
+  const r2 = (r + 2) * (r + 2);
+  for (let k = LIFE.length - 1; k >= 0; k--) { const e = LIFE[k], dx = cxOf(e) - x, dy = cyOf(e) - y; if (dx * dx + dy * dy <= r2 + bh(e) * bh(e) / 4) LIFE.splice(k, 1); }
+  for (let k = SPEARS.length - 1; k >= 0; k--) { const s = SPEARS[k], dx = s.x - x, dy = s.y - y; if (dx * dx + dy * dy <= r2) SPEARS.splice(k, 1); }
+  for (let k = BLOOD.length - 1; k >= 0; k--) { const b = BLOOD[k], dx = b.x - x, dy = b.y - y; if (dx * dx + dy * dy <= r2) BLOOD.splice(k, 1); }
+}
+function lifeClear() { LIFE.length = 0; SPEARS.length = 0; BLOOD.length = 0; FIRES.length = 0; camp = null; }
+function plantTree(x, y) {
+  // a tree (wood trunk, leafy crown) or a bush, standing on whatever ground is under the brush
+  if (!inb(x, Math.max(0, y))) return;
+  y = Math.max(0, y);
+  let gy = y;
+  if (type[gy * W + x]) { while (gy > 0 && type[(gy - 1) * W + x]) gy--; }
+  else { while (gy < H - 1 && !type[(gy + 1) * W + x] && !lOcc[(gy + 1) * W + x]) gy++; gy++; }
+  if (gy >= H || lOcc[gy * W + x] || gy < 12) return;
+  treeN++;
+  if (Math.random() < 0.3) {                                   // bush
+    const r = 3 + Math.random() * 2;
+    for (let dy = -2 * r; dy <= 0; dy++) for (let dx = -r - 1; dx <= r + 1; dx++) {
+      const ex = dx / (r + 1), ey = (dy + r) / r;
+      if (ex * ex + ey * ey <= 1 + (Math.random() - 0.5) * 0.4) placeCell(x + dx, gy - 1 + dy, ID.PLANT);
+    }
+    return;
+  }
+  const th = 9 + ((Math.random() * 9) | 0), tw = th > 14 ? 3 : 2, top = gy - th;
+  for (let yy = gy - 1; yy >= top; yy--) for (let xx = 0; xx < tw; xx++) placeCell(x + xx, yy, ID.WOOD);
+  const bx = x + tw / 2, by = top - 2, rx = 5 + Math.random() * 3, ry = 4 + Math.random() * 2;
+  for (const s of [-1, 1]) for (let k = 1; k <= 3; k++) placeCell(Math.round(bx + s * (k + tw / 2 - 1)), top + 2 - k, ID.WOOD);
+  for (let dy = -Math.ceil(ry) - 1; dy <= Math.ceil(ry); dy++) for (let dx = -Math.ceil(rx) - 1; dx <= Math.ceil(rx) + 1; dx++) {
+    const ex = dx / rx, ey = dy / ry;
+    if (ex * ex + ey * ey <= 1 + (Math.random() - 0.5) * 0.35) {
+      const xx = Math.round(bx + dx - 0.5), yy = Math.round(by + dy);
+      if (placeCell(xx, yy, ID.PLANT)) vel[yy * W + xx] = 0;
+    }
+  }
+}
+function lifeBrush(x, y) {
+  if (rc - lifeLastSpawn < 9) return;
+  lifeLastSpawn = rc;
+  if (sel === ID.TREE) { plantTree(x, y); return; }
+  const sp = LIFE_SP[sel], S = SPECIES[sp], n = 1 + (brush >= 8 ? (brush / 8) | 0 : 0);
+  for (let k = 0; k < n && LIFE.length < LIFE_MAX; k++) {
+    const ox = Math.round(x + (k ? (Math.random() * 2 - 1) * brush : 0) - S.w / 2);
+    let top = Math.round(y - S.h / 2), ok = false;
+    for (let u = 0; u < 90; u++) if (!boxSolid(ox, top - u, S.w, S.h)) { top -= u; ok = true; break; }
+    if (!ok || ox < 0 || ox + S.w > W) continue;
+    LIFE.push(lifeNew(sp, ox, top));
+  }
+}
+function lifeAt(x, y) {
+  let best = null, bd = 30;
+  for (const e of LIFE) { const dx = cxOf(e) - x - 0.5, dy = cyOf(e) - y - 0.5, d = dx * dx + dy * dy - bh(e) * bh(e) / 4; if (d < bd) { bd = d; best = e; } }
+  return best;
+}
+function lifeLabel(e) {
+  const S = SPECIES[e.sp], nm = e.sp === HU ? e.name : S.n;
+  if (e.dead) return nm + ' · dead (' + e.cause + ')';
+  let s = nm + ' · ' + e.doing + ' · ♥' + Math.ceil(e.hp);
+  if (e.sp === HU) {
+    const inv = [];
+    if (e.spear) inv.push('spear'); if (e.wood) inv.push('wood ' + e.wood); if (e.stone) inv.push('stone ' + e.stone);
+    if (e.meat) inv.push('raw meat ' + e.meat); if (e.cooked) inv.push('cooked ' + e.cooked); if (e.berries) inv.push('berries ' + e.berries); if (e.seeds) inv.push('seeds ' + e.seeds);
+    s += ' · hunger ' + (e.hunger | 0) + '% · thirst ' + (e.thirst | 0) + '%' + (e.warm < 50 ? ' · cold' : '') + (inv.length ? ' · ' + inv.join(', ') : '');
+  } else s += ' · hunger ' + (e.hunger | 0) + '%';
+  return s;
+}
+
+// ---------- drawing ----------
+// tiny sprites: one character per pixel. Colours come from the creature (skin, shirt, fur) so every one looks a bit different
+const SPR_DEER = [['      a ', '     ah ', '     hhn', 'tbbbbbh ', ' bbbbbb ', ' ll  ll ', ' ll  ll '],
+                  ['      a ', '     ah ', '     hhn', 'tbbbbbh ', ' bbbbbb ', ' ll  ll ', 'l  ll  l']];
+const SPR_RABBIT = [['  e', 'tbh', 'bb '], ['  e', 'tbh', 'b b']];
+const SPR_WOLF = [['    e  ', 't   hhn', 'tbbbbh ', ' bbbb  ', ' ll ll '], ['    e  ', 't   hhn', 'tbbbbh ', ' bbbb  ', 'l  l  l']];
+let lifeHeat = false;
+function lpx(x, y, r, g, b) {
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  const i = y * W + x;
+  if (lifeHeat) { pix[i] = HLUT[heatIdx(lifeHeat)]; return; }
+  let k = vig[i];
+  if (lightLive) { const q = ((y / LS) | 0) * LW + ((x / LS) | 0), L = (cR[q] + cG[q] + cB[q]) * 0.33; k *= 0.82 + Math.min(1.2, L * 0.5); r += cR[q] * 25; g += cG[q] * 16; b += cB[q] * 8; }
+  else k *= 0.9;
+  pix[i] = 0xff000000 | (clamp(b * k) << 16) | (clamp(g * k) << 8) | clamp(r * k);
+}
+function shadeC(c, f, e) {
+  const ch = e.char, hurt = e.hurtT > 0 && (e.hurtT & 2) ? 1 : 0;
+  let r = c[0] * f, g = c[1] * f, b = c[2] * f;
+  if (ch > 0) { r += (34 - r) * ch; g += (26 - g) * ch; b += (22 - b) * ch; }
+  if (e.dead) { r *= 0.75; g *= 0.72; b *= 0.72; }
+  if (hurt) { r = r * 0.5 + 128; g *= 0.5; b *= 0.5; }
+  return [r, g, b];
+}
+function drawSprite(e, rows, map) {
+  const fr = rows.length > 1 && !e.dead && Math.abs(e.vx) > 0.05 && e.ground ? rows[(e.anim >> 3) & 1] : rows[0];
+  const w = fr[0].length, h = fr.length, x0 = Math.round(e.x), y0 = Math.round(e.y), flip = e.dir < 0, up = e.dead;
+  for (let r = 0; r < h; r++) for (let c = 0; c < w; c++) {
+    const ch = fr[r][c];
+    if (ch === ' ') continue;
+    const col = map[ch]; if (!col) continue;
+    lpx(x0 + (flip ? w - 1 - c : c), y0 + (up ? h - 1 - r : r), col[0], col[1], col[2]);
+  }
+}
+function drawHuman(e) {
+  const x0 = Math.round(e.x), y0 = Math.round(e.y), d = e.dir, S = SPECIES[HU];
+  const sk = shadeC(e.skin, e.tone, e), hr = shadeC(e.hair, 1, e), sh = shadeC(e.shirt, 1, e), shd = shadeC(e.shirt, 0.72, e), pa = shadeC(e.pants, 1, e), bo = shadeC([40, 30, 24], 1, e);
+  const P = (x, y, c) => lpx(x, y, c[0], c[1], c[2]);
+  if (e.lie) {                                                      // lying down: head at the facing end
+    const hx = d > 0 ? x0 + S.h - 1 : x0, s = d > 0 ? -1 : 1, by = y0 + 1;
+    P(hx, by, hr); P(hx, by + 1, sk); P(hx + s, by, hr); P(hx + s, by + 1, sk); P(hx + s * 2, by + 1, sk);
+    for (let k = 3; k < 7; k++) { P(hx + s * k, by + 1, sh); P(hx + s * k, by, k === 3 ? sk : shd); }
+    for (let k = 7; k < 10; k++) { P(hx + s * k, by + 1, pa); if (k > 7) P(hx + s * k, by, pa); }
+    P(hx + s * 9, by + 1, bo);
+    if (e.spear && !e.dead) for (let k = 0; k < 7; k++) P(hx + s * (k + 1), by + 2, k === 0 ? [150, 150, 160] : [120, 86, 50]);
+    return;
+  }
+  const back = d > 0 ? x0 : x0 + 2, mid = x0 + 1, front = d > 0 ? x0 + 2 : x0;
+  // head
+  P(x0, y0, hr); P(x0 + 1, y0, hr); P(x0 + 2, y0, hr);
+  P(back, y0 + 1, hr); P(mid, y0 + 1, sk); P(front, y0 + 1, sk);
+  if (!e.dead && (e.anim % 200) > 4) lpx(front, y0 + 1, sk[0] * 0.45, sk[1] * 0.45, sk[2] * 0.45);    // eye (blinks)
+  P(back, y0 + 2, sk); P(mid, y0 + 2, sk); P(front, y0 + 2, sk);
+  // body
+  for (let r = 3; r < 7; r++) { P(back, y0 + r, shd); P(mid, y0 + r, sh); P(front, y0 + r, sh); }
+  // legs: walk cycle
+  const moving = Math.abs(e.vx) > 0.05 && e.ground, ph = (e.anim >> 3) & 1;
+  P(x0, y0 + 7, pa); P(x0 + 1, y0 + 7, pa); P(x0 + 2, y0 + 7, pa);
+  if (!moving || !ph) { P(x0, y0 + 8, pa); P(x0 + 2, y0 + 8, pa); P(x0, y0 + 9, bo); P(x0 + 2, y0 + 9, bo); }
+  else { P(mid, y0 + 8, pa); P(mid, y0 + 9, bo); P(front, y0 + 8, pa); P(front + d, y0 + 9, bo); }
+  // arm: swings when walking, chops when working
+  const ax = front + d;
+  if (e.act > 0) {
+    const up = (e.anim >> 2) & 1;
+    if (up) { P(ax, y0 + 2, sk); P(ax, y0 + 3, sh); } else { P(ax, y0 + 4, sh); P(ax + d, y0 + 5, sk); }
+  } else if (moving) { P(ph ? ax : back - d, y0 + 4, sh); }
+  // held spear (vertical, tip up) / carried logs on the back
+  if (e.spear) {
+    const sx = front + d * (e.act > 0 ? 2 : 1);
+    for (let r = -3; r < 8; r++) P(sx, y0 + r, r < -1 ? [170, 172, 180] : [120, 86, 50]);
+  }
+  if (e.wood >= 6) { const wx = back - d; P(wx, y0 + 3, [112, 74, 40]); P(wx, y0 + 4, [96, 62, 34]); P(wx, y0 + 5, [112, 74, 40]); }
+  // little signs above the head: heart when sharing, red ! when panicking
+  if (e.iconT > 0 && !e.dead) {
+    const R = [235, 60, 80], Y = [255, 90, 50];
+    if (e.icon === 1) { P(x0, y0 - 5, R); P(x0 + 2, y0 - 5, R); P(x0, y0 - 4, R); P(x0 + 1, y0 - 4, R); P(x0 + 2, y0 - 4, R); P(x0 + 1, y0 - 3, R); }
+    else if (e.icon === 2) { P(mid, y0 - 6, Y); P(mid, y0 - 5, Y); P(mid, y0 - 4, Y); P(mid, y0 - 2, Y); }
+  }
+}
+function drawLife(heat) {
+  if (!LIFE.length && !SPEARS.length && !BLOOD.length) return;
+  lifeHeat = false;
+  for (const b of BLOOD) {
+    const x = Math.round(b.x), y = Math.round(b.y), a = b.stuck >= 0 ? Math.max(0.35, 1 - b.t / 2400) : 1;
+    if (heat) { lifeHeat = 30; lpx(x, y); lifeHeat = false; continue; }
+    lpx(x, y, 120 * a + 20, 10, 12);
+  }
+  for (const pass of [0, 1, 2]) for (const e of LIFE) {
+    if ((pass === 0) !== e.dead || (pass === 2) !== (e.sp === HU && !e.dead)) continue;
+    lifeHeat = heat ? Math.max(0.01, e.bodyT) : false;
+    if (e.sp === HU) drawHuman(e);
+    else if (e.sp === DEER) drawSprite(e, SPR_DEER, { a: shadeC([92, 66, 40], 1, e), h: shadeC([150, 100, 58], e.tone, e), n: shadeC([30, 22, 18], 1, e), t: shadeC([230, 224, 210], 1, e), b: shadeC([150, 100, 58], e.tone, e), l: shadeC([110, 74, 44], 1, e), ...(e.antlers ? {} : { a: null }) });
+    else if (e.sp === RABBIT) drawSprite(e, SPR_RABBIT, { e: shadeC(e.fur, 0.85, e), t: shadeC([240, 240, 236], 1, e), b: shadeC(e.fur, e.tone, e), h: shadeC(e.fur, 1.05, e) });
+    else drawSprite(e, SPR_WOLF, { e: shadeC(e.fur, 0.8, e), t: shadeC(e.fur, 0.9, e), h: shadeC(e.fur, 1.05, e), n: shadeC([24, 24, 26], 1, e), b: shadeC(e.fur, e.tone, e), l: shadeC(e.fur, 0.8, e) });
+  }
+  lifeHeat = false;
+  for (const s of SPEARS) {
+    const a = s.fly ? Math.atan2(s.vy, s.vx) : 0, ca = Math.cos(a), sa = Math.sin(a);
+    for (let k = 0; k < 7; k++) {
+      const x = Math.round(s.x - ca * k), y = Math.round(s.y - sa * k);
+      if (heat) { lifeHeat = 24; lpx(x, y); lifeHeat = false; } else if (k < 2) lpx(x, y, 170, 172, 180); else lpx(x, y, 120, 86, 50);
+    }
+  }
+}
+
 
 // ---------- rendering ----------
 const cv = document.getElementById('c');
@@ -3298,7 +4487,7 @@ function render() {
   rc++;
   lightEff = lightOn && qLevel < 3;
   splatLiquids();
-  if (heatView) { renderHeat(); if (presView) overlayPressure(); drawCursor(); ctx.putImageData(img, 0, 0); return; }
+  if (heatView) { renderHeat(); drawLife(true); if (presView) overlayPressure(); drawCursor(); ctx.putImageData(img, 0, 0); return; }
   scanColumns();
   if (lightEff) { boxH(occ, fTmp, W, H, 2); boxV(fTmp, occB, W, H, 2); }
   trackBodies();
@@ -3307,6 +4496,7 @@ function render() {
   splatGrains();
   buildLight(emSum);
   compose();
+  drawLife(false);
   if (presView) overlayPressure();
   drawCursor();
   ctx.putImageData(img, 0, 0);
@@ -3619,7 +4809,7 @@ window.addEventListener('keydown', e => { if (e.key === 'Shift') shiftDown = tru
 window.addEventListener('keyup', e => { if (e.key === 'Shift') shiftDown = false; });
 window.addEventListener('blur', () => { shiftDown = false; });
 const $ = id => document.getElementById(id);
-const CAT_ORDER = ['Powders', 'Liquids', 'Solids', 'Gases', 'Energy', 'Tools'];
+const CAT_ORDER = ['Powders', 'Liquids', 'Solids', 'Gases', 'Energy', 'Life', 'Tools'];
 const ENERGY = { FIRE: 1, HEATER: 1, COOLER: 1, TNT: 1, THERMITE: 1, NITRO: 1 };
 const QUICK = ['SAND', 'WATER', 'STONE', 'WOOD', 'FIRE', 'LAVA', 'OIL', 'METAL', 'GLASS', 'PLANT'];
 const DESC = {
@@ -3640,11 +4830,16 @@ const DESC = {
   RUBBER: 'Bouncy, unbreakable, burns with thick smoke', COPPER: 'Conducts heat best, turns green in water', TNT: 'Blows up when heated',
   HONEY: 'Very thick and slow', MERCURY: 'Liquid metal: so dense that even metal floats on it', NITRO: 'Explodes from heat or a hard knock',
   CO2: 'Heavy invisible gas: sinks, pools and puts out fires', HYDROGEN: 'Lightest gas, rises fast, burns explosively into steam',
+  HUMAN: 'Thinks for itself: drinks, chops wood, mines, picks plants, carves spears, hunts, builds and feeds campfires, cooks, shares food. Can burn, drown, freeze, starve and be crushed. Hover one to see what it is doing',
+  DEER: 'Grazes plants, drinks, runs from hunters and wolves. Meat for humans',
+  RABBIT: 'Fast, skittish, breeds quickly when it finds plants',
+  WOLF: 'Hunts in packs, eats carcasses, fears campfires. Attacks unarmed people',
+  TREE: 'Grows a tree (or a bush) on the ground under the brush: wood to chop, leaves to pick',
 };
-function catOf(i) { const e = DEFS[i]; return i === 0 ? 'Tools' : ENERGY[e.key] ? 'Energy' : ['Tools', 'Solids', 'Powders', 'Liquids', 'Gases'][e.k] || 'Tools'; }
+function catOf(i) { const e = DEFS[i]; return i === 0 ? 'Tools' : isLifeTool(i) ? 'Life' : ENERGY[e.key] ? 'Energy' : ['Tools', 'Solids', 'Powders', 'Liquids', 'Gases'][e.k] || 'Tools'; }
 const hotkey = {};
 QUICK.forEach((k, n) => { if (ID[k] !== undefined) hotkey[ID[k]] = n === 9 ? '0' : String(n + 1); });
-hotkey[0] = 'E';
+hotkey[0] = 'E'; hotkey[ID.HUMAN] = 'H';
 const buttons = [];
 const grpBox = {};
 let catOn = '';
@@ -3808,7 +5003,7 @@ function clearAll() {
     return;
   }
   dmg.fill(0); soot.fill(0); grp.fill(0); held.fill(0); ng = 0; RBS.length = 0; rbOwner.fill(0); type.fill(0); temp.fill(AMBIENT); life.fill(0); vel.fill(0); hv.fill(0); lOcc.fill(0); lKind.fill(-1); np = 0;
-  gS.fill(0); gV.fill(0); gM.fill(0); gF.fill(0); gC.fill(0); gK.fill(0); gH.fill(0); AX.fill(0); AY.fill(0); AP.fill(0); PR.fill(0); PXv.fill(0); PYv.fill(0); PGX.fill(0); PGY.fill(0); PDV.fill(0); HS.fill(0); LPs.fill(0); LPb.fill(0); FU.fill(0); FV.fill(0); FT.fill(0); PRS.fill(0); PST.fill(0); pxOn = false; presActive = false; hsActive = false; }
+  gS.fill(0); gV.fill(0); gM.fill(0); gF.fill(0); gC.fill(0); gK.fill(0); gH.fill(0); AX.fill(0); AY.fill(0); AP.fill(0); PR.fill(0); PXv.fill(0); PYv.fill(0); PGX.fill(0); PGY.fill(0); PDV.fill(0); HS.fill(0); LPs.fill(0); LPb.fill(0); FU.fill(0); FV.fill(0); FT.fill(0); PRS.fill(0); PST.fill(0); pxOn = false; presActive = false; hsActive = false; lifeClear(); }
 
 function cellAt(e) {
   const r = cv.getBoundingClientRect();
@@ -3817,6 +5012,7 @@ function cellAt(e) {
 function toolPaint(x, y) {
   // heat / cool: change the temperature of everything under the brush (cells, liquid, flying grains, air)
   // wind: push the air (and what floats in it) the way the mouse is dragged
+  if (isLifeTool(sel)) { lifeBrush(x, y); return; }
   const r = brush, r2 = r * r + 1;
   if (sel === ID.HEAT || sel === ID.COOL) {
     const hot = sel === ID.HEAT, d = (shiftDown ? 70 : 5) * (hot ? 1 : -1), lim = hot ? (shiftDown ? 3000 : 900) : (shiftDown ? -270 : -60);
@@ -3874,6 +5070,7 @@ function paint(x, y, erase) {
   const pourP = Math.min(0.5, spawnBudget / (3.2 * (r * r + 1)));
   if (!erase && isTool(sel)) { toolPaint(x, y); return; }
   if (erase || sel === 0) {
+    lifeErase(x, y, r);
     for (let k = np - 1; k >= 0; k--) {
       const dx = px[k] - x - 0.5, dy = py[k] - y - 0.5;
       if (dx * dx + dy * dy <= r * r + 1) removeP(k);
@@ -3947,6 +5144,7 @@ window.addEventListener('keydown', e => {
   else if (k === '[') setBrush(brush - 1);
   else if (k === ']') setBrush(brush + 1);
   else if (k === 'e' || k === 'E') select(0);
+  else if (k === 'h' || k === 'H') select(ID.HUMAN);
   else if (k >= '0' && k <= '9') { const id = ID[QUICK[k === '0' ? 9 : +k - 1]]; if (id !== undefined) select(id); }
 });
 
@@ -4302,6 +5500,8 @@ function frameBody(now) {
     else if (gM[i] > 0.05) nm = 'Methane';
     else if (gH[i] > 0.05) nm = 'Hydrogen';
     else if (gK[i] > 0.05) nm = 'CO2';
+    const le = LIFE.length ? lifeAt(mx, my) : null;
+    if (le) nm = lifeLabel(le);
     $('iEl').textContent = nm;
     const pv = (type[i] ? 0 : pAt(i)) * 10;
     $('iT').textContent = temp[i].toFixed(0) + ' °C' + (pv > 0.5 || pv < -0.5 ? ' · ' + pv.toFixed(0) + ' kPa' : '');
