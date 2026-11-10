@@ -79,7 +79,7 @@ function extract(source, name) {
           for(let k=0;k<(mode==='ambient'?0:mode==='sparse'?50:N);k++){
             const i=mode==='dense'?k:Math.random()*N|0;
             temp[i]=k%3===0?200.0001:k%3===1?-270:100000;
-            if(k%5===0)type[i]=ID.METAL;
+            if(k%5===0)type[i]=ID.STONE;   // (metals get extra conduction rounds on purpose since the physics update; everything else must match exactly)
             if(k%7===0){lOcc[i]=1;lKind[i]=0;}
             if(k%11===0)gF[i]=0.5;
           }

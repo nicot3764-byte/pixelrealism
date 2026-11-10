@@ -366,7 +366,7 @@ const WIND = DEFS.map(e => e.k === 2 ? ({ SAND:2.2, DIRT:2.8, SALT:2.4, GUNPOWDE
 // solids: STATIC never move (they anchor whatever is attached), RHO = density vs water (floating), STRENGTH = resists
 // breaking (impacts, blasts), DEBRIS = what a broken piece turns into
 // air drag of a flying grain: heavy grains drop, snow and ash drift
-const DRAG = DEFS.map(e => e.k === 2 ? ({ SAND:0.012, DIRT:0.012, SALT:0.012, GUNPOWDER:0.016, SNOW:0.12, GRAVEL:0.006, SHARDS:0.01, SAWDUST:0.05, ASH:0.16 })[e.key] : 0);
+const DRAG = DEFS.map(e => e.k === 2 ? ({ SAND:0.012, DIRT:0.012, SALT:0.012, GUNPOWDER:0.016, SNOW:0.12, GRAVEL:0.011, SHARDS:0.01, SAWDUST:0.05, ASH:0.16 })[e.key] : 0);
 // pile shape: REACH 1 = rolls whenever the diagonal is free (~45°), 2 = cohesive, needs a 2-pixel drop (steeper);
 // ROLL = chance a grain also creeps sideways toward a drop, which flattens sand to a natural ~34°
 const REACH = DEFS.map(e => e.k === 2 ? ({ DIRT:2, SNOW:2, SAWDUST:2, ASH:2, CLAY:2, CEMENT:2 })[e.key] || 1 : 1);
@@ -407,6 +407,7 @@ const LQ_RHO = [1.0, 0.8, 1.15, 2.4, 1.4, 13.5, 1.6];          // relative densi
 const LQ_FLIP = [0.97, 0.95, 0.96, 0.25, 0.12, 0.97, 0.95];    // lower = thicker (lava and honey are very viscous)
 const LQ_DAMP = [1.0, 0.995, 1.0, 0.94, 0.9, 1.0, 1.0];
 const LQ_COND = [0.22, 0.08, 0.15, 0.3, 0.1, 0.5, 0.1];
+const LQ_VISC = [0.025, 0.04, 0.025, 0.3, 0.22, 0.02, 0.04];   // how much of its speed a body loses per tick to the liquid's stickiness (lava and honey cling, mercury hardly at all)
 const pRho = k => { const f = 1 - 0.0004 * (pt[k] - 20); return LQ_RHO[pk[k]] * (f > 0.25 ? f : 0.25); };   // thermal expansion: warm liquid is lighter and rises (floored so a white-hot liquid can never reach zero or negative density)
 
 // Grow with the scene; capacity is allocated storage, never a particle limit.
@@ -442,6 +443,15 @@ const IS_TOUCH = (() => { try { return matchMedia('(pointer:coarse)').matches ||
 let spawnBudget = 0;                                            // liquid particles the brush may still add this frame
 const QN = new Int32Array(GN * 4), QW = new Float32Array(GN * 4), QI = new Float32Array(GN);   // pressure stencil, rebuilt every solve
 const SB = new Uint8Array(N);                                    // 1 where a pixel is solid (rebuilt every frame by particlesToGrid)
+// Moving rigid bodies as seen by the liquid: per liquid cell, how many of its pixels a moving body covers and the summed
+// velocity of those pixels (linear + spin). Closed faces next to such a cell move with the body instead of standing still,
+// so a plunging rock shoves the water out of its way (crater, crown splash, wake) and a rising one draws it in behind.
+const SVC = new Uint8Array(GN), SVX = new Float32Array(GN), SVY = new Float32Array(GN);
+let svAny = false;
+const SV_MAX = 4.5;
+// Momentum handed to the liquid from outside the solver (grains plunging into it), per liquid cell; applied before the next solve.
+const LIX = new Float32Array(GN), LIY = new Float32Array(GN);
+let liAny = false, lqRhoMax = 1;
 const CI = new Uint32Array(N);                                   // 800x480 already exceeds 65535 coarse cells: never truncate cell indices
 for (let i = 0; i < N; i++) CI[i] = (((i / W) | 0) >> 1) * GX + (((i % W)) >> 1);
 
@@ -563,8 +573,31 @@ function particlesToGrid() {
   UO_.set(U_); VO_.set(V_);
 }
 function boundaryFaces() {
-  for (let i = 0; i < U.length; i++) if (uC[i]) U[i] = 0;
-  for (let i = 0; i < V.length; i++) if (vC[i]) V[i] = 0;
+  if (!svAny) {
+    for (let i = 0; i < U.length; i++) if (uC[i]) U[i] = 0;
+    for (let i = 0; i < V.length; i++) if (vC[i]) V[i] = 0;
+    return;
+  }
+  // a closed face is a wall: it has the wall's own speed (zero for the fixed world, the body's for a moving body)
+  const GX_ = GX, GY_ = GY, GU = GX_ + 1, U_ = U, V_ = V, uC_ = uC, vC_ = vC, SVC_ = SVC, SVX_ = SVX, SVY_ = SVY;
+  for (let j = 0; j < GY_; j++) {
+    const row = j * GU, cr = j * GX_;
+    U_[row] = 0; U_[row + GX_] = 0;
+    for (let i = 1; i < GX_; i++) {
+      if (!uC_[row + i]) continue;
+      const a = cr + i - 1, b = a + 1, na = SVC_[a], nb = SVC_[b];
+      U_[row + i] = na > 1 ? (nb > 1 ? 0.5 * (SVX_[a] / na + SVX_[b] / nb) : SVX_[a] / na) : nb > 1 ? SVX_[b] / nb : 0;
+    }
+  }
+  for (let i = 0; i < GX_; i++) { V_[i] = 0; V_[GY_ * GX_ + i] = 0; }
+  for (let j = 1; j < GY_; j++) {
+    const row = j * GX_;
+    for (let i = 0; i < GX_; i++) {
+      if (!vC_[row + i]) continue;
+      const a = row - GX_ + i, b = row + i, na = SVC_[a], nb = SVC_[b];
+      V_[row + i] = na > 1 ? (nb > 1 ? 0.5 * (SVY_[a] / na + SVY_[b] / nb) : SVY_[a] / na) : nb > 1 ? SVY_[b] / nb : 0;
+    }
+  }
 }
 function faceRho(a, b) {   // density at the face between grid cells a and b (air takes the liquid side's value)
   const fa = cTyp[a] === 1, fb = cTyp[b] === 1;
@@ -654,10 +687,13 @@ function eject(k) {
   // a solid moved onto (or was drawn over) this particle: move it to the nearest open pixel, preferring up;
   // if it is buried deep inside a big solid, it is simply gone (better than bursting out of the rock)
   const cx = Math.floor(px[k]), cy = Math.floor(py[k]);
+  // pushed out by a moving body: it leaves with the body's speed (the water in front of a sinking rock sinks with it)
+  let evx = 0, evy = 0;
+  if (svAny && cx >= 0 && cx < W && cy >= 0 && cy < H) { const ci = CI[cy * W + cx], n = SVC[ci]; if (n) { evx = SVX[ci] / n; evy = SVY[ci] / n; } }
   for (let d = 1; d <= 30; d++) {
-    for (const ox of [0, -1, 1]) if (!blocked(cx + ox, cy - d)) { px[k] = cx + ox + 0.5; py[k] = cy - d + 0.7; pvx[k] = 0; pvy[k] = 0; return; }
+    for (const ox of [0, -1, 1]) if (!blocked(cx + ox, cy - d)) { px[k] = cx + ox + 0.5; py[k] = cy - d + 0.7; pvx[k] = evx; pvy[k] = evy; return; }
     if (d <= 12) for (const [ox, oy] of [[-d, 0], [d, 0], [-d, -1], [d, -1], [0, d]]) {
-      if (!blocked(cx + ox, cy + oy)) { px[k] = cx + ox + 0.5; py[k] = cy + oy + 0.5; pvx[k] = 0; pvy[k] = 0; return; }
+      if (!blocked(cx + ox, cy + oy)) { px[k] = cx + ox + 0.5; py[k] = cy + oy + 0.5; pvx[k] = evx; pvy[k] = evy; return; }
     }
   }
   px[k] = -10; py[k] = -10;                         // off the map: removed in liquidsFromPixels
@@ -733,6 +769,20 @@ function liquidPhysics() {
   }
   particlesToGrid();
   for (let i = 0; i < V.length; i++) V[i] += L_G;
+  if (liAny) {
+    const GU = GX + 1;
+    for (let c = 0; c < GN; c++) {
+      let ix = LIX[c], iy = LIY[c];
+      if (ix === 0 && iy === 0) continue;
+      LIX[c] = 0; LIY[c] = 0;
+      if (cTyp[c] !== 1) continue;
+      if (ix > 1.5) ix = 1.5; else if (ix < -1.5) ix = -1.5;
+      if (iy > 1.5) iy = 1.5; else if (iy < -1.5) iy = -1.5;
+      const j = (c / GX) | 0, u0 = j * GU + c - j * GX;
+      U[u0] += 0.5 * ix; U[u0 + 1] += 0.5 * ix; V[c] += 0.5 * iy; V[c + GX] += 0.5 * iy;
+    }
+    liAny = false;
+  }
   boundaryFaces();
   pressureSolve();
   boundaryFaces();
@@ -745,14 +795,17 @@ function liquidsToPixels() {
   // Local buffer references keep the inner loops out of the shared script scope.
   const px_ = px, py_ = py, pt_ = pt, pk_ = pk, lOcc_ = lOcc, lKind_ = lKind, tSum_ = tSum, type_ = type, temp_ = temp;
   lOcc_.fill(0); lKind_.fill(-1);
+  let rmax = 1;
   for (let k = 0; k < np; k++) {
     const x = Math.floor(px_[k]), y = Math.floor(py_[k]);
+    if (LQ_RHO[pk_[k]] > rmax) rmax = LQ_RHO[pk_[k]];
     if (!inb(x, y)) continue;
     const c = y * W_ + x;
     if (lOcc_[c] === 0) tSum_[c] = 0;
     lOcc_[c]++;
     tSum_[c] += pt_[k]; lKind_[c] = pk_[k];
   }
+  lqRhoMax = rmax;
   for (let k = 0; k < np; k++) {
     const x = Math.floor(px_[k]), y = Math.floor(py_[k]);
     if (!inb(x, y)) continue;
@@ -780,6 +833,7 @@ function nitroBlast(x, y) {
   }
   explode(x, y, n * 3);
 }
+const BOIL_LATENT = 320;
 function liquidsFromPixels() {
   for (let k = np - 1; k >= 0; k--) {
     const x = Math.floor(px[k]), y = Math.floor(py[k]);
@@ -797,7 +851,12 @@ function liquidsFromPixels() {
           if (inb(nx, ny)) { const n = ny * W + nx; if (KIND[type[n]] === 1) hurt(n, sp2 * (1 - STRENGTH[type[n]]) * 4); }
         }
       }
-      if (T > 100) { removeP(k); temp[c] -= 12; const a = airAbove(c); if (a >= 0) { gV[a] += 1; if (temp[a] < 105) temp[a] = 105; } }
+      if (T > 100) {
+        // boiling takes heat: water stays at 100 °C and the heat beyond that is what turns it into steam, bit by bit
+        // (latent heat). A pot warms through before it boils, and boiling water cools whatever heats it.
+        pt[k] = 100; if (t === 0) temp[c] = 100;
+        if (Math.random() * BOIL_LATENT < T - 100) { removeP(k); const a = airAbove(c); if (a >= 0) { gV[a] += 1; if (temp[a] < 105) temp[a] = 105; } }
+      }
       else if (T < -1 && type[c] === 0) { removeP(k); setCell(c, ID.ICE); temp[c] = -3; }
     } else if (li === 1) {                                       // OIL
       if (T > IGN[ID.OIL]) {                                   // hot oil boils off as fuel vapour, which then burns
@@ -1518,6 +1577,8 @@ function ignite(i) {
     let co = 0;
     for (let q = 0; q < 4; q++) { const ax = x + DX[q], ay = y + DY[q]; if (inb(ax, ay)) co += gK[ay * W + ax]; }
     if (co > 0.05) return;
+    const a = airBeside(i, x, y);
+    if (fireAir(a < 0 ? i : a, false) < OX_MIN) { fireFrame = frame; return; }   // ... or in a closed room whose air is used up (keep checking: someone may open it)
   }
   if (t === ID.GUNPOWDER || t === ID.TNT) { explode(i % W, (i / W) | 0); return; }
   if (KIND[t] === 1 || KIND[t] === 2) { life[i] = Math.max(8, (e.burn * (0.6 + Math.random() * 0.8)) | 0); if (temp[i] < 650) temp[i] = 650; }
@@ -1589,6 +1650,72 @@ function explode(x, y, bonus) {
   }
 }
 
+// ---- the air a fire breathes ----
+// Every so often (only while something burns) the air is sorted into connected regions on the coarse air grid. The region that
+// reaches the open top is the outside: endless fresh air. Any other region is a closed room with a fixed stock of oxygen (one unit
+// per air cell) that its fires use up; below OX_MIN of the original share nothing burns in it any more. Opening the room joins
+// it to the outside and the air freshens within a second or two; splitting or merging rooms shares the oxygen by size.
+const oxLab = new Int32Array(GN), oxF = new Float32Array(GN).fill(1), oxWas = new Uint8Array(GN), oxStack = new Int32Array(GN);
+let oxO2 = new Float32Array(64), oxArea = new Float32Array(64), oxFrame = -1e9, fireFrame = -1e9;
+let oxDirty = false;                                   // used-up air somewhere: keep the regions current even with no fire (a wall may be opened)
+const OX_EVERY = 20, OX_USE = 0.019, OX_MIN = 0.65;
+function airRegions() {
+  oxFrame = frame;
+  const GX_ = GX, GN_ = GN, lab = oxLab, sol = ASol, st = oxStack;
+  let dirty = false;
+  for (let c = 0; c < GN_; c++) {
+    const id = lab[c];
+    if (id > 1) { oxF[c] = oxO2[id] / oxArea[id]; oxWas[c] = 1; if (oxF[c] < 0.995) dirty = true; }
+    else if (id === 1) { if (oxF[c] < 1) { oxF[c] += (1 - oxF[c]) * 0.5; if (oxF[c] > 0.995) oxF[c] = 1; else dirty = true; } oxWas[c] = 1; }
+    else oxWas[c] = 0;
+    lab[c] = 0;
+  }
+  oxDirty = dirty;
+  let sp = 0, next = 2;
+  for (let i = 0; i < GX_; i++) if (!sol[i]) { lab[i] = 1; st[sp++] = i; }
+  for (let seed = -1; ; ) {
+    let area = 0, sum = 0, old = 0;
+    const id = seed < 0 ? 1 : next;
+    while (sp) {
+      const c = st[--sp], x = c % GX_;
+      area++; if (oxWas[c]) { sum += oxF[c]; old++; }
+      if (x > 0 && !lab[c - 1] && !sol[c - 1]) { lab[c - 1] = id; st[sp++] = c - 1; }
+      if (x < GX_ - 1 && !lab[c + 1] && !sol[c + 1]) { lab[c + 1] = id; st[sp++] = c + 1; }
+      if (c >= GX_ && !lab[c - GX_] && !sol[c - GX_]) { lab[c - GX_] = id; st[sp++] = c - GX_; }
+      if (c < GN_ - GX_ && !lab[c + GX_] && !sol[c + GX_]) { lab[c + GX_] = id; st[sp++] = c + GX_; }
+    }
+    if (seed >= 0) {
+      if (next >= oxO2.length) { const a = new Float32Array(next * 2), b = new Float32Array(next * 2); a.set(oxO2); b.set(oxArea); oxO2 = a; oxArea = b; }
+      oxArea[next] = area; oxO2[next] = (old ? sum / old : 1) * area; next++;      // (cells that were solid a moment ago bring no air of their own)
+    }
+    for (seed++; seed < GN_ && (lab[seed] || sol[seed]); seed++);
+    if (seed >= GN_) break;
+    lab[seed] = next; st[sp++] = seed;
+  }
+}
+function airBeside(i, x, y) {   // an air pixel next to cell i (-1: none)
+  return y > 0 && isAir(i - W) ? i - W : x > 0 && isAir(i - 1) ? i - 1 : x < W - 1 && isAir(i + 1) ? i + 1 : y < H - 1 && isAir(i + W) ? i + W : -1;
+}
+function fireAir(a, use) {
+  // share of its oxygen left in the air at pixel a (1 = fresh); with `use`, a burning cell takes its breath from it
+  if (a < 0) return 1;
+  let c = CI[a], id = oxLab[c];
+  if (!id) {                                           // a pixel in a cell that counts as wall for the air (a crack, a pocket in the embers): it shares the air around it
+    const x0 = c % GX, y0 = (c / GX) | 0;
+    for (let r = 1; r <= 3 && !id; r++) for (let dy = -r; dy <= r && !id; dy++) {
+      const yy = y0 + dy; if (yy < 0 || yy >= GY) continue;
+      const edge = dy === -r || dy === r;
+      for (let dx = -r; dx <= r; dx += edge ? 1 : 2 * r) {
+        const xx = x0 + dx; if (xx < 0 || xx >= GX) continue;
+        if (oxLab[yy * GX + xx]) { c = yy * GX + xx; id = oxLab[c]; break; }
+      }
+    }
+    if (!id) return 1;
+  }
+  if (id === 1) return oxF[c];
+  if (use) { const v = oxO2[id] - OX_USE; oxO2[id] = v > 0 ? v : 0; }
+  return oxO2[id] / oxArea[id];
+}
 function exposedAt(x, y) {
   // touches open air (or porous ash) on some side
   for (let q = 0; q < 4; q++) {
@@ -1663,7 +1790,10 @@ function react(i, x, y, t) {
     if (temp[i] < 650) temp[i] = 650;
     if (KIND[t] === 1 && hv[i] < 120) hv[i]++;                     // charring progresses (hv = char level on solids)
     // fire needs air: only surfaces that touch air (or loose ash) burn; buried wood just smoulders and waits
-    if (!exposedAt(x, y)) return;
+    if (!exposedAt(x, y)) {
+      if (r < 0.06 && t !== ID.THERMITE && fireAir(i, false) < OX_MIN) { life[i] = 0; temp[i] = Math.min(temp[i], 250); }   // no air left in the room: the embers die too
+      return;
+    }
     if (--life[i] <= 0) {
       gS[i] += 0.3; type[i] = 0; hv[i] = 0;
       if (Math.random() < 0.2) addGrain(ID.ASH, x + 0.5, y + 0.5, (Math.random() - 0.5) * 0.4, -0.4 - Math.random() * 0.6, 300);   // ash rides the updraft
@@ -1676,6 +1806,17 @@ function react(i, x, y, t) {
       const j = ay * W + ax, tj = type[j];
       if (IGN[tj] >= 1e9 || life[j] !== 0 || (KIND[tj] !== 1 && KIND[tj] !== 2)) continue;
       if (Math.random() < (DY[q] < 0 ? 0.12 : DY[q] > 0 ? 0.03 : 0.06) && exposedAt(ax, ay)) ignite(j);
+    }
+    // burning uses up the air. Under the open sky there is always more; in a closed room the oxygen runs down and the
+    // fire dies with fuel still left (thermite carries its own oxygen)
+    fireFrame = frame;
+    if (t !== ID.THERMITE) {
+      const a = airBeside(i, x, y);
+      if (fireAir(a < 0 ? i : a, true) < OX_MIN && r < 0.25) {   // (bedded in ash it still breathes the room's air)
+        life[i] = 0; temp[i] = Math.min(temp[i], 250);
+        if (a >= 0) gS[a] += 0.25;                                    // it goes out smoking
+        return;
+      }
     }
     // flames: mostly up, a little to the sides
     if (y > 0) addHeatFlame(i - W, 1100, 0.75, 0.02);
@@ -1826,6 +1967,9 @@ function grainStep() {
     if (p >= 0 && lOcc[p]) {
       // in a liquid: heavy drag, sinks slowly if denser, floats up if lighter
       const lr = LQ_RHO[lKind[p]] * 100, d = DENS[t];
+      // what the grain loses to the liquid's drag, the liquid gains: pouring sand makes the water splash, dimple and swirl
+      const ci = CI[p], k = 0.18 * d / (4 * lr);
+      LIX[ci] += vx * k; LIY[ci] += vy * k; liAny = true;
       vx *= 0.82; vy = vy * 0.82 + (d > lr ? 0.03 : -0.02);
     } else {
       vy += L_G;
@@ -1965,7 +2109,7 @@ const bStart = [], bLen = [];
 const rbOwner = new Int32Array(N);
 const RBS = [];
 let rbNext = 1;
-const RB_G = L_G, RB_FRICTION = 0.6;
+const RB_G = L_G, RB_FRICTION = 0.6, RB_CD = 0.6, RB_DYN_A = 0.6;
 function liqRhoAt(j) { return lOcc[j] ? LQ_RHO[lKind[j]] : 0; }
 function isLiq(c) { return type[c] === 0 && (lOcc[c] > 0 || cTyp[(((c / W) | 0) / GS | 0) * GX + ((c % W) / GS | 0)] === 1); }
 function pressureAt(j) {
@@ -1985,19 +2129,37 @@ function pressureAt(j) {
   }
   return d * rho * RB_G;
 }
-const LF = { fx: 0, fy: 0, tau: 0, wet: 0, sub: 0 };
+const LF = { fx: 0, fy: 0, tau: 0, wet: 0, sub: 0, dx: 0, dy: 0, dtau: 0, ux: 0, uy: 0 };
+// dynamic pressure: what the liquid solver's pressure at a wet face shows beyond the weight of still liquid there. It is the
+// push of moving liquid (a jet hitting a crate, a current against a log, a wave) and the water's resistance to a moving body.
+// A moving body feels it at once (this tick's pressure); a resting one only when it lasts (the slow average that walls feel),
+// so a jet or a steady current shoves a crate along but one splash does not shift a dam.
+const LF_DEAD = 0.15, LF_FLOOR = 0.6, LF_PMAX = 4;
+const lfV = new Int32Array(4096);
+let lfSlow = false;
+function dynP(j, ph) {
+  const cj = CI[j];
+  if (cTyp[cj] !== 1) return 0;
+  const pd = (lfSlow ? LPb[cj] : Pr[cj] * L_PSCALE) - ph * (1 + LF_DEAD) - LF_FLOOR;
+  return pd <= 0 ? 0 : pd > LF_PMAX ? LF_PMAX : pd;
+}
 function surfaceAbove(j) {   // y of the free surface above liquid pixel j (or -1 if it is covered)
   let c = j;
   while (c >= 0 && isLiq(c)) c -= W;
   return c < 0 || type[c] === 0 ? ((c + W) / W) | 0 : -1;
 }
 const lfCand = [];
+function topLiq(c, y) {   // isLiq works per 2x2 liquid cell: step down to the row that really holds liquid, so a body floats in the surface that is drawn
+  for (let s = 0; s < 2 && !lOcc[c] && y < H - 1 && type[c + W] === 0; s++) { y++; c += W; }
+  return y;
+}
 function liquidForce(cells, n, own, comX, comY) {
   // sideways: hydrostatic pressure on every wet side face (lets water shove a dam);
   // up: Archimedes - every body cell below the waterline is pushed up by the liquid it displaces (stable floating)
-  LF.fx = 0; LF.fy = 0; LF.tau = 0; LF.wet = 0; LF.sub = 0; LF.n = n;
+  LF.fx = 0; LF.fy = 0; LF.tau = 0; LF.wet = 0; LF.sub = 0; LF.n = n; LF.dx = 0; LF.dy = 0; LF.dtau = 0; LF.ux = 0; LF.uy = 0;
   lfCand.length = 0;
-  let rhoL = 0, wetBelow = false;
+  let rhoL = 0, wetBelow = false, nV = 0, su = 0, sv = 0, ns = 0, visc = 0;
+  const sparse = n > 96;
   for (let m = 0; m < n; m++) {
     const c = cells[m], x = c % W, y = (c / W) | 0;
     let wet = false;
@@ -2007,17 +2169,31 @@ function liquidForce(cells, n, own, comX, comY) {
       const j = ny * W + nx;
       if (type[j] !== 0 || own(j) || !isLiq(j)) continue;
       wet = true;
-      if (lOcc[j]) rhoL = Math.max(rhoL, LQ_RHO[lKind[j]]);
-      if (q < 2) {
-        const p = pressureAt(j), fx = -DX[q] * p;
-        LF.fx += fx; LF.tau -= (y + 0.5 - comY) * fx;
+      if (lOcc[j]) { rhoL = Math.max(rhoL, LQ_RHO[lKind[j]]); if (LQ_VISC[lKind[j]] > visc) visc = LQ_VISC[lKind[j]]; }
+      if (!sparse || ((x + y) & 1) === 0) {            // the current around the body: the liquid's own speed a little way off its wet faces
+        let sx = nx + 2 * DX[q], sy = ny + 2 * DY[q];
+        if (!inb(sx, sy) || !isLiq(sy * W + sx)) { sx = nx; sy = ny; }
+        su += sampleU(U, (sx + 0.5) / GS, (sy + 0.5) / GS); sv += sampleV(V, (sx + 0.5) / GS, (sy + 0.5) / GS); ns++;
       }
+      if (q < 2) {
+        let p = pressureAt(j);
+        if (lfSlow) {                                  // a resting body: a sheet of spray running up its face is not a head of water (the solver's own pressure knows)
+          const cj = CI[j];
+          if (cTyp[cj] === 1) { const ps = LPb[cj] * 1.15 + 0.3; if (ps < p) p = ps; }
+        }
+        const fx = -DX[q] * p;
+        LF.fx += fx; LF.tau -= (y + 0.5 - comY) * fx;
+        const pd = dynP(j, p);
+        if (pd > 0) { LF.dx -= DX[q] * pd; LF.dtau += (y + 0.5 - comY) * DX[q] * pd; }
+      } else if (nV < 4096) lfV[nV++] = q === 2 ? j : -j - 1;   // wet faces below / above: judged once the waterline is known
       if (q === 2) wetBelow = true;                  // DY[2] = +1: liquid under the body
       if (q < 2 && lfCand.length < 64) { const sy = surfaceAbove(j); if (sy >= 0) lfCand.push(sy); }
     }
     if (wet) LF.wet++;
   }
   if (!LF.wet) return;
+  if (ns) { LF.ux = su / ns; LF.uy = sv / ns; }
+  LF.visc = visc || LQ_VISC[0];
   if (!rhoL) rhoL = 1;
   LF.rho = rhoL;
   // waterline: the free surface of the open water a few pixels to either side (not the water clinging to the body)
@@ -2030,15 +2206,20 @@ function liquidForce(cells, n, own, comX, comY) {
     if (!isLiq(c)) {                                     // dry at this height: look for the surface lower down
       let d = 0;
       while (y < H - 1 && d < 80 && !isLiq(c) && type[c] === 0) { y++; c += W; d++; }
-      if (isLiq(c)) lfCand.push(y);
+      if (isLiq(c)) lfCand.push(topLiq(c, y));
       continue;
     }
     while (y > 0 && isLiq(c - W)) { y--; c -= W; }
-    if (type[c - W] === 0) lfCand.push(y);
+    if (type[c - W] === 0) lfCand.push(topLiq(c, y));
   }
   let L = wetBelow ? -1e9 : 1e9;                         // no open water nearby: fully under if liquid is below, else just wet on top
   if (lfCand.length) { lfCand.sort((p, q) => p - q); L = lfCand[lfCand.length >> 1]; }
   const b = rhoL * RB_G;
+  if (L > -1e8 && L < 1e8) for (let m = 0; m < nV; m++) {
+    const below = lfV[m] >= 0, j = below ? lfV[m] : -lfV[m] - 1, d = ((j / W) | 0) + 0.5 - L;
+    const pd = dynP(j, d > 0 ? d * b : 0);
+    if (pd > 0) { const fy = below ? -pd : pd; LF.dy += fy; LF.dtau += (j % W + 0.5 - comX) * fy; }
+  }
   for (let m = 0; m < n; m++) {
     const c = cells[m], x = c % W, y = (c / W) | 0;
     if (y + 0.5 < L) continue;
@@ -2176,7 +2357,17 @@ function rbRaster(rb, own) {
       return;
     }
     type[c] = rb.mt[k]; temp[c] = rb.mtm[k]; life[c] = rb.mlf[k]; nz[c] = rb.mnz[k]; hv[c] = rb.mhv[k]; grp[c] = rb.mgr[k]; dmg[c] = rb.mdm[k]; vel[c] = 0; moved[c] = 1;
-    if (own) { rbOwner[c] = rb.id; rb.raster.push(c); rb.rk.push(k); }
+    if (own) {
+      rbOwner[c] = rb.id; rb.raster.push(c); rb.rk.push(k);
+      if (np) {                                         // tell the liquid how fast this pixel of the body is moving
+        const ci = CI[c];
+        const sv = rb.sv ?? 1;
+        let ux = (rb.vx - rb.w * (py + 0.5 - (rb.comY ?? rb.y))) * sv, uy = (rb.vy + rb.w * (px + 0.5 - (rb.comX ?? rb.x))) * sv;
+        if (ux > SV_MAX) ux = SV_MAX; else if (ux < -SV_MAX) ux = -SV_MAX;
+        if (uy > SV_MAX) uy = SV_MAX; else if (uy < -SV_MAX) uy = -SV_MAX;
+        if (SVC[ci] < 255) { SVC[ci]++; SVX[ci] += ux; SVY[ci] += uy; svAny = true; }
+      }
+    }
   });
 }
 function rbImpact(rb, speed) {
@@ -2233,10 +2424,28 @@ function rbStep(rb) {
   rb.vx += LF.fx / M; rb.vy += LF.fy / M; rb.w += LF.tau / I;
   rb.vx += AF.fx / M; rb.vy += AF.fy / M; rb.w += AF.tau / I;   // air pressure and wind: the push grows with the exposed surface and shrinks with the mass
   if (LF.wet) {
-    // water drag: the deeper a body sits, the harder the water resists it (a floating plank settles instead of bobbing)
-    const f = Math.min(1, LF.sub / Math.max(1, LF.n));
-    rb.vx *= 0.93; rb.vy *= 0.93 - 0.12 * f; rb.w *= 0.85;
-    if (LF.rho > 2) { rb.vx *= 0.7; rb.vy *= 0.7; rb.w *= 0.5; }   // lava is thick as syrup: things in it barely drift
+    // moving liquid pushes, and liquid resists being pushed: the solver's pressure on the wet faces, limited so that
+    // resistance can slow a body but never throw it back (a light plank in heavy water must not start to buzz)
+    let ax = LF.dx / M, ay = LF.dy / M, aw = LF.dtau / I;
+    const v2 = rb.vx * rb.vx + rb.vy * rb.vy;
+    let along = v2 > 1e-6 ? (ax * rb.vx + ay * rb.vy) / v2 : 0;      // the part of the push that works against the motion
+    if (along < 0) { ax -= along * rb.vx; ay -= along * rb.vy; if (along < -0.9) along = -0.9; } else along = 0;
+    const al = Math.hypot(ax, ay);
+    if (al > RB_DYN_A) { ax *= RB_DYN_A / al; ay *= RB_DYN_A / al; }
+    if (aw > 0.012) aw = 0.012; else if (aw < -0.012) aw = -0.012;
+    if (aw * rb.w < 0 && Math.abs(aw) > 0.5 * Math.abs(rb.w)) aw = -0.5 * rb.w;
+    rb.vx += along * rb.vx + ax; rb.vy += along * rb.vy + ay; rb.w += aw;
+    // drag: form drag grows with the square of the speed (big, heavy things sink fast, small ones slowly); a body that
+    // sits in the surface also loses its motion to the waves it makes, so a floating plank bobs a few times and settles
+    // All of it is measured against the liquid's own motion, so a current carries what floats in it.
+    const f = Math.min(1, LF.sub / Math.max(1, LF.n)), rvx = rb.vx - LF.ux, rvy = rb.vy - LF.uy;
+    const q = 1 / (1 + RB_CD * LF.rho * Math.sqrt(LF.sub) * Math.hypot(rvx, rvy) / M), afloat = f > 0.03 && f < 0.97;
+    // The liquid's stickiness (lava and honey are thick as syrup, water and mercury barely cling) works on the wet surface, so
+    // like the form drag it moves a small light thing easily and a massive block hardly at all.
+    const keep = 1 - LF.visc * Math.min(1, 14 * LF.rho * Math.sqrt(LF.sub + 1) / M);
+    rb.vx = LF.ux + rvx * q * keep; rb.vy = LF.uy + rvy * q * keep;
+    if (afloat) rb.vy *= 0.955;
+    rb.w *= LF.visc > 0.1 ? (1 - LF.visc) * 0.8 : 0.9;
   }
   const sp = Math.hypot(rb.vx, rb.vy);
   if (sp > 6) { rb.vx *= 6 / sp; rb.vy *= 6 / sp; }
@@ -2320,6 +2529,13 @@ function rbStep(rb) {
   const slow = Math.abs(rb.vx) < 0.04 && Math.abs(rb.vy) < 0.09 && Math.abs(rb.w) < 0.0025;
   if (touching && slow) rb.rest++; else rb.rest = 0;
   if (rb.rest > (LF.wet ? 30 : 12)) { rbRaster(rb, false); return false; }
+  if (np) {
+    // How much of its speed a body can hand to the liquid at once: a heavy rock ploughs on and takes the water with it, a light
+    // plank landing flat meets far more water than it weighs and all but stops (m / (m + water it has to move), like a collision).
+    const ca = Math.abs(Math.cos(rb.a)), sa = Math.abs(Math.sin(rb.a)), ex = ca * rb.mw + sa * rb.mh, ey = sa * rb.mw + ca * rb.mh;
+    const vl = Math.hypot(rb.vx, rb.vy) + 1e-6, wp = (Math.abs(rb.vy) * ex + Math.abs(rb.vx) * ey) / vl;
+    rb.sv = M / (M + 0.4 * (LF.wet ? LF.rho : lqRhoMax) * wp * wp);
+  }
   rbRaster(rb, true);
   return true;
 }
@@ -2410,6 +2626,7 @@ function isOwnPx(rb, px, py) {
   return i >= 0 && j >= 0 && i < rb.mw && j < rb.mh && rb.mt[j * rb.mw + i] > 0;
 }
 function rigidBodies() {
+  if (svAny) { SVC.fill(0); SVX.fill(0); SVY.fill(0); svAny = false; }
   const list = RBS.slice();
   for (const rb of list) if (!rbStep(rb)) { const k = RBS.indexOf(rb); if (k >= 0) RBS.splice(k, 1); }
 }
@@ -2763,11 +2980,12 @@ function solidBodies() {
     // 2) centre of mass hangs past the edge of what holds it up -> topples
     if (comX < sx0 - 0.25 || comX > sx1 + 0.25) { if (!crumbBody(s0, n)) wakeBody(s0, n, 0, 0); continue; }
     // 3) liquid pressure: floats up, or pushes harder sideways than friction can hold -> moves (dam failure)
-    liquidForce(bCells.subarray(s0, s0 + n), n, j => bLabel[j] === lbl, comX, comY);
+    lfSlow = true; liquidForce(bCells.subarray(s0, s0 + n), n, j => bLabel[j] === lbl, comX, comY); lfSlow = false;
     if (LF.wet) {
       const weight = M * RB_G;
-      if (-LF.fy > weight * 1.02 || Math.abs(LF.fx) > RB_FRICTION * Math.max(0, weight + LF.fy) || tipTorque(M, comX, comY, sx0, sx1, sy).t !== 0)
-        { if (!crumbBody(s0, n)) wakeBody(s0, n, Math.sign(LF.fx) * 0.05, 0); }
+      const fx = LF.fx + LF.dx, fy = LF.fy + LF.dy;       // still liquid's weight plus the push of moving liquid (a jet shoves a crate, a fountain lifts a ball)
+      if (-fy > weight * 1.02 || Math.abs(fx) > RB_FRICTION * Math.max(0, weight + fy) || tipTorque(M, comX, comY, sx0, sx1, sy).t !== 0)
+        { if (!crumbBody(s0, n)) wakeBody(s0, n, Math.sign(fx) * 0.05, 0); }
     }
   }
   if (hadWake) { wakeReq.fill(0); wakeAny = false; }
@@ -2781,6 +2999,11 @@ function condOf(i) {
 }
 const kCond = new Float32Array(N);
 const thermalRows = new Uint8Array(H), condRows = new Uint8Array(H);
+// Metals carry heat far better than one exchange per tick can show (the simple exchange is limited for stability), so
+// good conductors get extra exchange rounds among themselves: a copper bar in a fire is soon hot along its length,
+// steel follows, stone and glass stay cool a hand's width from the flame.
+const FASTK = DEFS.map(e => e.key === 'COPPER' ? 1 : e.key === 'METAL' ? 0.55 : 0), FAST_ROUNDS = 6;
+const fastX0 = new Int16Array(H), fastX1 = new Int16Array(H);
 function conduct() {
   const W_ = W, H_ = H;
   // Local buffer references keep the inner loops out of the shared script scope.
@@ -2793,12 +3016,17 @@ function conduct() {
       if (temp_[i] !== AMBIENT) { thermalRows[y] = 1; break; }
     }
   }
+  let fastAny = false;
+  const FASTK_ = FASTK;
   const conductivityRow = (y, ambient = true) => {
     if (condRows[y]) return;
+    let f0 = W_, f1 = -1;
     for (let i = y * W_, end = i + W_; i < end; i++) {
       const t = type_[i];
       kCond_[i] = t ? COND_[t] : lOcc_[i] ? LQ_COND_[lKind_[i]] : gF_[i] > 0.05 ? 0.35 : !ambient && temp_[i] > 200 ? 0.08 : COND_[0];
+      if (t && FASTK_[t] > 0) { const x = i - y * W_; if (x < f0) f0 = x; f1 = x; }
     }
+    fastX0[y] = f0; fastX1[y] = f1; if (f1 >= 0) fastAny = true;
     condRows[y] = 1;
   };
   // Freeze the conductivity of all initially warm rows before any diffusion.
@@ -2822,9 +3050,25 @@ function conduct() {
       temp_[i] = Ti + (AMBIENT - Ti) * (type_[i] === 0 && lOcc_[i] === 0 ? 0.004 : 0.0006);
     }
   }
+  if (!fastAny) return;
+  for (let r = 0; r < FAST_ROUNDS; r++) {
+    for (let y = 0; y < H_; y++) {
+      if (!condRows[y] || fastX1[y] < 0) continue;
+      const row = y * W_, down = y + 1 < H_ && condRows[y + 1] && fastX1[y + 1] >= 0;
+      for (let x = fastX0[y], xe = fastX1[y]; x <= xe; x++) {
+        const i = row + x, fi = FASTK_[type_[i]];
+        if (fi === 0) continue;
+        let Ti = temp_[i];
+        if (x < xe) { const fj = FASTK_[type_[i + 1]]; if (fj > 0) { const d = (Ti - temp_[i + 1]) * (fi < fj ? fi : fj) * 0.25; Ti -= d; temp_[i + 1] += d; } }
+        if (down) { const fj = FASTK_[type_[i + W_]]; if (fj > 0) { const d = (Ti - temp_[i + W_]) * (fi < fj ? fi : fj) * 0.25; Ti -= d; temp_[i + W_] += d; } }
+        temp_[i] = Ti;
+      }
+    }
+  }
 }
 
 function step() {
+  if ((frame - fireFrame < 240 || oxDirty) && frame - oxFrame >= OX_EVERY) airRegions();
   liquidPhysics();
   liquidsToPixels();
   moved.fill(0); vac.fill(0);
@@ -5110,7 +5354,7 @@ function clearAll() {
     if (NET.live && (document.body.classList.contains('phone') || confirm('Clear the canvas for everyone?'))) gsend({ t: 'c', c: 'clear' });
     return;
   }
-  dmg.fill(0); soot.fill(0); grp.fill(0); held.fill(0); ng = 0; RBS.length = 0; rbOwner.fill(0); type.fill(0); temp.fill(AMBIENT); life.fill(0); vel.fill(0); hv.fill(0); lOcc.fill(0); lKind.fill(-1); np = 0;
+  dmg.fill(0); soot.fill(0); grp.fill(0); held.fill(0); ng = 0; RBS.length = 0; rbOwner.fill(0); SVC.fill(0); SVX.fill(0); SVY.fill(0); svAny = false; LIX.fill(0); LIY.fill(0); liAny = false; oxLab.fill(0); oxF.fill(1); oxFrame = -1e9; fireFrame = -1e9; oxDirty = false; type.fill(0); temp.fill(AMBIENT); life.fill(0); vel.fill(0); hv.fill(0); lOcc.fill(0); lKind.fill(-1); np = 0;
   gS.fill(0); gV.fill(0); gM.fill(0); gF.fill(0); gC.fill(0); gK.fill(0); gH.fill(0); AX.fill(0); AY.fill(0); AP.fill(0); PR.fill(0); PXv.fill(0); PYv.fill(0); PGX.fill(0); PGY.fill(0); PDV.fill(0); HS.fill(0); LPs.fill(0); LPb.fill(0); FU.fill(0); FV.fill(0); FT.fill(0); PRS.fill(0); PST.fill(0); pxOn = false; presActive = false; hsActive = false; lifeClear(); }
 
 function cellAt(e) {
@@ -5612,7 +5856,8 @@ function frameBody(now) {
     if (le) nm = lifeLabel(le);
     $('iEl').textContent = nm;
     const pv = (type[i] ? 0 : pAt(i)) * 10;
-    $('iT').textContent = temp[i].toFixed(0) + ' °C' + (pv > 0.5 || pv < -0.5 ? ' · ' + pv.toFixed(0) + ' kPa' : '');
+    const ox = type[i] ? 1 : fireAir(i, false);                      // used-up air in a closed room (fresh air is 21 % oxygen; below ~14 % nothing burns)
+    $('iT').textContent = temp[i].toFixed(0) + ' °C' + (pv > 0.5 || pv < -0.5 ? ' · ' + pv.toFixed(0) + ' kPa' : '') + (ox < 0.995 ? ' · O₂ ' + Math.round(ox * 21) + ' %' : '');
   }
   if ((frame & 15) === 0) {
     let c = 0; for (let i = 0; i < N; i++) if (type[i]) c++;
